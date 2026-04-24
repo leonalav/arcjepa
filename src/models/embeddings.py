@@ -16,7 +16,7 @@ class ActionEmbedding(nn.Module):
     Categorical Action Embedding: ActionType + X + Y.
     Implements the z_a = ActionEmbed(7) + XEmbed(30) + YEmbed(30) logic.
     """
-    def __init__(self, d_model: int, num_actions: int = 8, grid_size: int = 64):
+    def __init__(self, d_model: int, num_actions: int = 9, grid_size: int = 64):
         super().__init__()
         # 0 is NONE/PAD, 1-7 are ACTION1-7
         self.action_type_embed = nn.Embedding(num_actions, d_model)

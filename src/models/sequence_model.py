@@ -23,15 +23,18 @@ class GDNSequenceModel(nn.Module):
         **kwargs
     ):
         super().__init__()
-        if not HAS_FLA:
-            # We will use a mock if FLA is not found, but the user requested FLA.
-            # In a real environment, we would ensure FLA is installed.
+        if not HAS_FLA or not torch.cuda.is_available():
+            # Fallback for CPU-only environments or missing fla
             self.model = None
-            print("Warning: flash-linear-attention (fla) not found. GDNSequenceModel will not function.")
+            if not HAS_FLA:
+                print("Warning: flash-linear-attention (fla) not found. GDNSequenceModel will not function.")
+            else:
+                print("Warning: GPU not detected. Disabling fla-based GDN (Triton requires CUDA).")
         else:
+            # GatedDeltaNet in 'fla' uses 'hidden_size' and 'num_heads'
             self.model = GatedDeltaNet(
-                d_model=d_model,
-                n_heads=n_heads,
+                hidden_size=d_model,
+                num_heads=n_heads,
                 chunk_size=chunk_size,
                 **kwargs
             )
@@ -51,5 +54,9 @@ class GDNSequenceModel(nn.Module):
             return x, None
             
         # GatedDeltaNet from fla supports both parallel and recurrent modes
-        # depending on the presence of state/cache.
-        return self.model(x, state=state, use_cache=use_cache)
+        # Depending on the version, it might return (output, state) or (output, state, last_state)
+        # We ensure we only return (output, state) to match the WorldModel expectations.
+        res = self.model(x, state=state, use_cache=use_cache)
+        if isinstance(res, (tuple, list)):
+            return res[0], res[1]
+        return res, None
