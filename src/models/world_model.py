@@ -99,42 +99,33 @@ class ARCJEPAWorldModel(nn.Module):
             # Embed the action for step t
             z_a_t = self.action_embed(actions[:, t], cx[:, t], cy[:, t]) # [B, d_model]
 
-            # Multi-step prediction mode
-            if self.multistep_k > 1 and t + self.multistep_k <= T:
-                # Collect action embeddings for next k steps
-                action_embeds_k = []
-                for i in range(self.multistep_k):
-                    if t + i < T:
-                        z_a_i = self.action_embed(actions[:, t + i], cx[:, t + i], cy[:, t + i])
-                        action_embeds_k.append(z_a_i)
-
-                if len(action_embeds_k) == self.multistep_k:
-                    action_embeds_k = torch.stack(action_embeds_k, dim=1)  # [B, k, d_model]
-
-                    # Multi-step rollout
-                    multistep_preds = self.predictor.forward_multistep(
-                        curr_state, action_embeds_k, self.multistep_k
-                    )  # [B, k, d_model]
-
-                    # Store the final k-step prediction
-                    next_latent = multistep_preds[:, -1]  # [B, d_model]
-
-                    # Store intermediate predictions for loss computation
-                    if t == K:  # Only store once per batch
-                        multistep_pred_latents = multistep_preds
-                else:
-                    # Fallback to single-step if not enough actions
-                    next_latent = self.predictor(curr_state.unsqueeze(1), z_a_t.unsqueeze(1)).squeeze(1)
-            else:
-                # Single-step prediction (default)
-                next_latent = self.predictor(curr_state.unsqueeze(1), z_a_t.unsqueeze(1)).squeeze(1)
-
+            # ALWAYS compute the 1-step prediction for the main sequence
+            # This ensures pred_latents matches target_latents temporally
+            next_latent = self.predictor(curr_state.unsqueeze(1), z_a_t.unsqueeze(1)).squeeze(1)
             pred_latents.append(next_latent)
 
-            # To predict the step AFTER next, we feed our prediction back into the GDN
-            # to update the temporal RNN state
+            # --- MULTI-STEP AUXILIARY BRANCH ---
+            # We compute this once per batch (at the transition t=K) to provide
+            # long-term gradients while avoiding breaking the temporal RNN chain.
+            if self.multistep_k > 1 and t == K and (t + self.multistep_k <= T):
+                action_embeds_k = []
+                for i in range(self.multistep_k):
+                    z_a_i = self.action_embed(actions[:, t + i], cx[:, t + i], cy[:, t + i])
+                    action_embeds_k.append(z_a_i)
+                
+                action_embeds_k = torch.stack(action_embeds_k, dim=1)  # [B, k, d_model]
+                
+                # Rollout k steps into the future without GDN feedback
+                multistep_preds = self.predictor.forward_multistep(
+                    curr_state, action_embeds_k, self.multistep_k
+                )  # [B, k, d_model]
+                
+                multistep_pred_latents = multistep_preds
+            # ------------------------------------
+
+            # To predict the step AFTER next, we feed our 1-STEP prediction back into the GDN
+            # to reliably update the temporal RNN state
             if t < T - 1:
-                # GDN expects sequence dimension [B, 1, d_model]
                 next_latent_seq = next_latent.unsqueeze(1)
                 gdn_out, rnn_state = self.gdn(next_latent_seq, state=rnn_state, use_cache=True)
                 curr_state = gdn_out.squeeze(1) # [B, d_model]
