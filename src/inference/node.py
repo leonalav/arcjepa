@@ -83,17 +83,11 @@ class MCTSNode:
 
         return exploitation + exploration
 
-    def is_fully_expanded(self, valid_action_coords: list) -> bool:
+    def is_fully_expanded(self, top_k: int) -> bool:
         """
-        Check if all valid actions have been tried from this node.
-
-        Args:
-            valid_action_coords: List of (action, x, y) tuples to consider
-
-        Returns:
-            True if all actions have been expanded
+        Check if the node has reached its target branching factor (Top-K).
         """
-        return len(self.children) >= len(valid_action_coords)
+        return len(self.children) >= top_k
 
     def select_best_child(self, c_puct: float) -> 'MCTSNode':
         """
@@ -138,7 +132,8 @@ class MCTSNode:
         action: int,
         coords: Tuple[int, int],
         s_next: torch.Tensor,
-        rnn_state_next: Optional[Any]
+        rnn_state_next: Optional[Any],
+        prior_p: float = 1.0
     ) -> 'MCTSNode':
         """
         Add a child node for the given action.
@@ -148,6 +143,7 @@ class MCTSNode:
             coords: (x, y) coordinates
             s_next: Next latent state [1, d_model]
             rnn_state_next: Next GDN recurrent cache
+            prior_p: Prior probability from Policy Head
 
         Returns:
             The newly created child node
@@ -162,7 +158,8 @@ class MCTSNode:
             rnn_state=rnn_state_next,
             parent=self,
             action_taken=action,
-            action_coords=coords
+            action_coords=coords,
+            prior_p=prior_p
         )
 
         self.children[key] = child

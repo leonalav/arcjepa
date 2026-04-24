@@ -56,6 +56,9 @@ class LatentMCTS:
         self.grid_embed = model.grid_embed
         self.pos_embed = model.pos_embed
         self.policy_head = model.policy_head
+        
+        # AlphaZero branching factor
+        self.top_k = 5
 
         # Statistics
         self.stats = {
@@ -102,9 +105,7 @@ class LatentMCTS:
             action_coords=None
         )
 
-        # Generate valid action-coordinate pairs (Root-Anchored Heuristics)
-        # We compute heuristics once at the root to avoid expensive decoding during expansion
-        valid_action_coords = self._generate_action_space(current_grid=input_grid)
+        # Reset statistics
 
         # Reset statistics
         self.stats = {
@@ -118,7 +119,7 @@ class LatentMCTS:
         with torch.no_grad():
             for sim in range(num_sims):
                 # Phase 1: Selection
-                node, depth = self._select(root, valid_action_coords)
+                node, depth = self._select(root)
 
                 # Update max depth
                 self.stats["max_depth_reached"] = max(self.stats["max_depth_reached"], depth)
@@ -133,7 +134,7 @@ class LatentMCTS:
 
                 # Phase 2: Expansion
                 if not node.is_terminal:
-                    child = self._expand(node, valid_action_coords)
+                    child = self._expand(node, top_k=self.top_k)
                     if child is not None:
                         self.stats["nodes_created"] += 1
                         node = child  # Evaluate the new child
@@ -163,16 +164,15 @@ class LatentMCTS:
 
         return root, self.stats
 
-    def _select(self, root: MCTSNode, valid_action_coords: list) -> Tuple[MCTSNode, int]:
+    def _select(self, root: MCTSNode) -> Tuple[MCTSNode, int]:
         """
-        Phase 1: Selection using UCT.
+        Phase 1: Selection using PUCT.
 
-        Traverse down the tree selecting children with highest UCT score
+        Traverse down the tree selecting children with highest PUCT score
         until we reach a node that is not fully expanded or is terminal.
 
         Args:
             root: Root node to start selection from
-            valid_action_coords: List of valid (action, x, y) tuples
 
         Returns:
             (selected_node, depth)
@@ -180,7 +180,7 @@ class LatentMCTS:
         node = root
         depth = 0
 
-        while not node.is_terminal and node.is_fully_expanded(valid_action_coords):
+        while not node.is_terminal and node.is_fully_expanded(self.top_k):
             if not node.children:
                 break
             node = node.select_best_child(self.config.c_puct)
@@ -188,47 +188,53 @@ class LatentMCTS:
 
         return node, depth
 
-    def _get_policy_priors(self, s_t: torch.Tensor, valid_action_coords: list) -> Dict[Tuple[int, int, int], float]:
+    def _expand(self, node: MCTSNode, top_k: int = 5) -> Optional[MCTSNode]:
         """
-        Get prior probabilities for all valid actions using the Latent Policy Head.
+        Phase 2: Expansion (AlphaZero Top-K style).
+        Bypasses root heuristics and extracts the Top-K actions directly from the Latent Policy Head.
         """
         import torch.nn.functional as F
+        
+        # 1. Dynamically generate Top-K policy priors for the CURRENT state
         with torch.no_grad():
-            logits = self.policy_head(s_t)  # [1, 9 + 64 + 64]
-            a_logits = logits[:, :9]
-            x_logits = logits[:, 9:73]
-            y_logits = logits[:, 73:137]
+            logits = self.policy_head(node.s_t)  # [1, 9 + 64 + 64]
+            a_probs = F.softmax(logits[:, :9], dim=1).squeeze(0)
+            x_probs = F.softmax(logits[:, 9:73], dim=1).squeeze(0)
+            y_probs = F.softmax(logits[:, 73:137], dim=1).squeeze(0)
 
-            a_probs = F.softmax(a_logits, dim=1)
-            x_probs = F.softmax(x_logits, dim=1)
-            y_probs = F.softmax(y_logits, dim=1)
+            # Outer product to get joint distribution [9, 64, 64]
+            # joint_probs[a, x, y] = P(a) * P(x) * P(y)
+            joint_probs = a_probs.view(9, 1, 1) * x_probs.view(1, 64, 1) * y_probs.view(1, 1, 64)
+            
+            # Flatten to find Top-K absolute best moves globally
+            flat_probs = joint_probs.flatten()
+            top_probs, top_indices = torch.topk(flat_probs, top_k)
 
-            priors = {}
-            for a, x, y in valid_action_coords:
-                # Factored probability: P(a,x,y) = P(a)*P(x)*P(y)
-                p = a_probs[0, a].item() * x_probs[0, x].item() * y_probs[0, y].item()
-                priors[(a, x, y)] = p
-        return priors
+        # 2. Convert flat indices back to (action, x, y)
+        untried_top_k = []
+        priors = {}
+        
+        for p, idx in zip(top_probs, top_indices):
+            idx = idx.item()
+            a = idx // (64 * 64)
+            rem = idx % (64 * 64)
+            x = rem // 64
+            y = rem % 64
+            
+            # Only consider it if it's a valid action type (e.g., skip SUBMIT if restricted)
+            if a in self.config.valid_actions:
+                action_tuple = (a, x, y)
+                priors[action_tuple] = p.item()
+                if action_tuple not in node.children:
+                    untried_top_k.append(action_tuple)
 
-    def _expand(self, node: MCTSNode, valid_action_coords: list) -> Optional[MCTSNode]:
-        """
-        Phase 2: Expansion.
-
-        Add one new child to the node by trying an unexplored action,
-        weighted by policy priors.
-        """
-        untried = node.get_untried_actions(valid_action_coords)
-
-        if not untried:
+        # 3. If all Top-K actions are already expanded, node is fully expanded
+        if not untried_top_k:
             return None
 
-        # Get priors for all untried actions to pick the most promising one
-        priors = self._get_policy_priors(node.s_t, untried)
-        
-        # Pick the action with the highest prior among untried
-        action_tuple = max(untried, key=lambda a: priors[a])
-        action, x, y = action_tuple
-        prior_p = priors[action_tuple]
+        # 4. Expand the highest-probability untried action
+        action, x, y = untried_top_k[0]
+        prior_p = priors[(action, x, y)]
 
         # Predict next state
         s_next, rnn_next = self._predict_next_state(
@@ -240,9 +246,7 @@ class LatentMCTS:
         )
 
         # Create child node with prior
-        child = node.add_child(action, (x, y), s_next, rnn_next, prior_p=prior_p)
-
-        return child
+        return node.add_child(action, (x, y), s_next, rnn_next, prior_p=prior_p)
 
     def _evaluate(self, s_t: torch.Tensor, target_grid: Optional[torch.Tensor] = None,
                   input_grid: Optional[torch.Tensor] = None) -> float:
