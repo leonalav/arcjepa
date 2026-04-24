@@ -21,6 +21,7 @@ class MCTSNode:
         parent: Optional['MCTSNode'] = None,
         action_taken: Optional[int] = None,
         action_coords: Optional[Tuple[int, int]] = None,
+        prior_p: float = 1.0
     ):
         """
         Initialize MCTS node.
@@ -31,6 +32,7 @@ class MCTSNode:
             parent: Parent node in the tree
             action_taken: Action index (1-7) that led to this node
             action_coords: (x, y) coordinates for the action
+            prior_p: Prior probability from Policy Head
         """
         # Latent state
         self.s_t = s_t
@@ -40,6 +42,7 @@ class MCTSNode:
         self.parent = parent
         self.action_taken = action_taken
         self.action_coords = action_coords
+        self.prior_p = prior_p
         self.children: Dict[Tuple[int, int, int], 'MCTSNode'] = {}  # (action, x, y) -> child
 
         # Visit statistics
@@ -62,23 +65,21 @@ class MCTSNode:
 
     def uct_score(self, c_puct: float, parent_visits: int) -> float:
         """
-        Calculate Upper Confidence Bound for Trees (UCT) score.
+        Calculate Predictor Upper Confidence Bound for Trees (PUCT) score.
 
-        UCT = Q + c_puct * sqrt(ln(N_parent) / N_child)
+        PUCT = Q + c_puct * P(s,a) * sqrt(N_parent) / (1 + N_child)
 
         Args:
             c_puct: Exploration constant
             parent_visits: Number of visits to parent node
 
         Returns:
-            UCT score (higher = more promising)
+            PUCT score (higher = more promising)
         """
-        if self.visits == 0:
-            # Unvisited nodes get infinite exploration bonus
-            return float('inf')
-
         exploitation = self.q_value()
-        exploration = c_puct * math.sqrt(math.log(parent_visits) / self.visits)
+        # PUCT variant: use prior_p to bias exploration
+        # (1 + self.visits) in denominator prevents division by zero and matches AlphaZero
+        exploration = c_puct * self.prior_p * math.sqrt(parent_visits) / (1 + self.visits)
 
         return exploitation + exploration
 

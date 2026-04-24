@@ -69,8 +69,12 @@ class MCTSConfig:
         elif self.coord_sampling == "heuristic":
             # Content-aware sampling (requires current_grid)
             if current_grid is None:
-                # Fall back to sparse if no grid provided
-                return self.get_coordinate_samples(grid_size)
+                # Safe fallback to sparse if no grid provided for heuristics
+                coords = []
+                for x in range(0, grid_size, self.coord_stride):
+                    for y in range(0, grid_size, self.coord_stride):
+                        coords.append((x, y))
+                return coords
 
             # Import here to avoid circular dependency
             from .grid_analysis import find_edges, find_frontier, find_symmetry_points

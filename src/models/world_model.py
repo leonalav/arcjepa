@@ -47,6 +47,15 @@ class ARCJEPAWorldModel(nn.Module):
         # Final State Decoder
         self.decoder = GridDecoder(d_model)
 
+        # Policy Head: s_t -> (action_logits, x_logits, y_logits)
+        # Enables AlphaZero-style pruning during latent search
+        self.policy_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Linear(d_model, 9 + 64 + 64) # 9 actions + 64x + 64y
+        )
+
     def encode(self, grids: torch.Tensor, encoder: nn.Module) -> torch.Tensor:
         """
         grids: [Batch, T, 64, 64]
@@ -150,10 +159,14 @@ class ARCJEPAWorldModel(nn.Module):
         # Decode the very last hallucinated state to see if it matches the true final grid
         final_state_logits = self.decoder(pred_latents[:, -1]) # [B, 16, 64, 64]
 
+        # 7. Compute Policy Logits (action/x/y predictions for training the search policy)
+        policy_logits = self.policy_head(pred_latents) # [B, T-K, 9+64+64]
+
         output = {
             'pred_latents': pred_latents,
             'target_latents': s_next_target,
-            'decoder_logits': final_state_logits
+            'decoder_logits': final_state_logits,
+            'policy_logits': policy_logits
         }
 
         # Add multi-step predictions if available

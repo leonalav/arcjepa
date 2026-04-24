@@ -75,13 +75,34 @@ class ARCJPELoss(nn.Module):
         std_target = torch.sqrt(target_latents.var(dim=0) + 1e-04)
         std_loss = torch.mean(F.relu(0.1 - std_target))
 
-        # 4. Covariance Regularization (VICReg extension)
+        # 4. Policy Loss (AlphaZero-style supervised policy training)
+        policy_logits = outputs['policy_logits'] # [B, T-K, 137]
+        B, pred_T, _ = policy_logits.shape
+        full_T = targets['actions'].shape[1]
+        K = full_T - pred_T
+        
+        gt_actions = targets['actions'][:, K:]
+        gt_x = targets['coords_x'][:, K:]
+        gt_y = targets['coords_y'][:, K:]
+        
+        # Split logits: 0:9 (actions), 9:73 (x), 73:137 (y)
+        action_logits = policy_logits[:, :, :9]
+        x_logits = policy_logits[:, :, 9:73]
+        y_logits = policy_logits[:, :, 73:137]
+        
+        l_action = F.cross_entropy(action_logits.flatten(0, 1), gt_actions.flatten())
+        l_x = F.cross_entropy(x_logits.flatten(0, 1), gt_x.flatten())
+        l_y = F.cross_entropy(y_logits.flatten(0, 1), gt_y.flatten())
+        
+        policy_loss = l_action + l_x + l_y
+
+        # 5. Covariance Regularization (VICReg extension)
         if self.use_vicreg:
             cov_loss = self.vicreg_cov_loss(target_latents)
         else:
             cov_loss = torch.tensor(0.0, device=target_latents.device)
 
-        # 5. Multi-step JEPA Loss (if provided)
+        # 6. Multi-step JEPA Loss (if provided)
         if 'multistep_pred_latents' in outputs and 'multistep_target_latents' in outputs:
             multistep_jepa_loss = F.mse_loss(
                 outputs['multistep_pred_latents'],
@@ -96,7 +117,8 @@ class ARCJPELoss(nn.Module):
             self.recon_weight * recon_loss +
             std_loss +
             self.vicreg_weight * cov_loss +
-            multistep_jepa_loss
+            multistep_jepa_loss +
+            policy_loss
         )
 
         return {
@@ -106,5 +128,6 @@ class ARCJPELoss(nn.Module):
             'std_loss': std_loss.item(),
             'cov_loss': cov_loss.item(),
             'focal_loss': focal_loss,
-            'multistep_jepa_loss': multistep_jepa_loss.item()
+            'multistep_jepa_loss': multistep_jepa_loss.item(),
+            'policy_loss': policy_loss.item()
         }

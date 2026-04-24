@@ -55,6 +55,7 @@ class LatentMCTS:
         self.action_embed = model.action_embed
         self.grid_embed = model.grid_embed
         self.pos_embed = model.pos_embed
+        self.policy_head = model.policy_head
 
         # Statistics
         self.stats = {
@@ -101,8 +102,9 @@ class LatentMCTS:
             action_coords=None
         )
 
-        # Generate valid action-coordinate pairs
-        valid_action_coords = self._generate_action_space()
+        # Generate valid action-coordinate pairs (Root-Anchored Heuristics)
+        # We compute heuristics once at the root to avoid expensive decoding during expansion
+        valid_action_coords = self._generate_action_space(current_grid=input_grid)
 
         # Reset statistics
         self.stats = {
@@ -186,26 +188,47 @@ class LatentMCTS:
 
         return node, depth
 
+    def _get_policy_priors(self, s_t: torch.Tensor, valid_action_coords: list) -> Dict[Tuple[int, int, int], float]:
+        """
+        Get prior probabilities for all valid actions using the Latent Policy Head.
+        """
+        import torch.nn.functional as F
+        with torch.no_grad():
+            logits = self.policy_head(s_t)  # [1, 9 + 64 + 64]
+            a_logits = logits[:, :9]
+            x_logits = logits[:, 9:73]
+            y_logits = logits[:, 73:137]
+
+            a_probs = F.softmax(a_logits, dim=1)
+            x_probs = F.softmax(x_logits, dim=1)
+            y_probs = F.softmax(y_logits, dim=1)
+
+            priors = {}
+            for a, x, y in valid_action_coords:
+                # Factored probability: P(a,x,y) = P(a)*P(x)*P(y)
+                p = a_probs[0, a].item() * x_probs[0, x].item() * y_probs[0, y].item()
+                priors[(a, x, y)] = p
+        return priors
+
     def _expand(self, node: MCTSNode, valid_action_coords: list) -> Optional[MCTSNode]:
         """
         Phase 2: Expansion.
 
-        Add one new child to the node by trying an unexplored action.
-
-        Args:
-            node: Node to expand from
-            valid_action_coords: List of valid (action, x, y) tuples
-
-        Returns:
-            Newly created child node, or None if no actions available
+        Add one new child to the node by trying an unexplored action,
+        weighted by policy priors.
         """
         untried = node.get_untried_actions(valid_action_coords)
 
         if not untried:
             return None
 
-        # Pick a random untried action
-        action, x, y = random.choice(untried)
+        # Get priors for all untried actions to pick the most promising one
+        priors = self._get_policy_priors(node.s_t, untried)
+        
+        # Pick the action with the highest prior among untried
+        action_tuple = max(untried, key=lambda a: priors[a])
+        action, x, y = action_tuple
+        prior_p = priors[action_tuple]
 
         # Predict next state
         s_next, rnn_next = self._predict_next_state(
@@ -216,8 +239,8 @@ class LatentMCTS:
             y
         )
 
-        # Create child node
-        child = node.add_child(action, (x, y), s_next, rnn_next)
+        # Create child node with prior
+        child = node.add_child(action, (x, y), s_next, rnn_next, prior_p=prior_p)
 
         return child
 
@@ -371,14 +394,23 @@ class LatentMCTS:
             # Unknown type, return as-is (risky but better than crashing)
             return rnn_state
 
-    def _generate_action_space(self) -> List[Tuple[int, int, int]]:
+    def _generate_action_space(self, current_grid: Optional[torch.Tensor] = None) -> List[Tuple[int, int, int]]:
         """
         Generate list of valid (action, x, y) tuples to consider.
+
+        Args:
+            current_grid: Optional grid for heuristic sampling
 
         Returns:
             List of (action, x, y) tuples
         """
-        coords = self.config.get_coordinate_samples()
+        # Squeeze batch dims if present for the heuristic functions
+        if current_grid is not None and current_grid.dim() > 2:
+            grid_to_pass = current_grid.squeeze()
+        else:
+            grid_to_pass = current_grid
+
+        coords = self.config.get_coordinate_samples(current_grid=grid_to_pass)
         action_space = []
 
         for action in self.config.valid_actions:
