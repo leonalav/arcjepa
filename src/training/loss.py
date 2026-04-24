@@ -30,10 +30,16 @@ class ARCJPELoss(nn.Module):
         # decoder_logits is [B, 16, 64, 64]
         recon_loss = F.cross_entropy(decoder_logits, final_state_gt)
         
-        total_loss = jepa_loss + self.recon_weight * recon_loss
+        # 3. Variance Regularization (VICReg-style to prevent collapse)
+        # Force the standard deviation of latents across the batch to be > 0.1
+        std_target = torch.sqrt(target_latents.var(dim=0) + 1e-04)
+        std_loss = torch.mean(F.relu(0.1 - std_target))
+        
+        total_loss = jepa_loss + self.recon_weight * recon_loss + std_loss
         
         return {
             'loss': total_loss,
             'jepa_loss': jepa_loss,
-            'recon_loss': recon_loss
+            'recon_loss': recon_loss,
+            'std_loss': std_loss
         }

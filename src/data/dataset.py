@@ -1,13 +1,16 @@
 import json
 import torch
 import numpy as np
-from torch.utils.data import Dataset
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import random
 
+# Discover project root (3 levels up from src/data/dataset.py)
+PROJECT_ROOT = Path(__file__).parent.parent.parent.resolve()
+
 # Official ARC-AGI imports
 import arc_agi
+from torch.utils.data import Dataset
 from arcengine import GameAction, GameState
 
 class ARCTrajectoryDataset(Dataset):
@@ -121,21 +124,29 @@ def create_mock_trajectory(output_dir: str, num_trajectories: int = 5):
     """
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     
+    # Define a local directory for ARC environments
+    env_dir = PROJECT_ROOT / "data" / "arc_environments"
+    env_dir.mkdir(parents=True, exist_ok=True)
+    
     # Instantiate the official Arcade entry point
-    arc = arc_agi.Arcade(environments_dir=None) # Discovers default public games
+    arc = arc_agi.Arcade(environments_dir=str(env_dir))
     
-    # Pick a standard beginner game from the ARC-AGI-3 corpus
-    game_id = "ls20"
+    # Standard ARC-AGI-3 beginner games
+    game_ids = ["ls20", "v750", "d963", "t432", "b210"]
     
-    print(f"Generating {num_trajectories} real trajectories using ARC-AGI-3 engine on game: {game_id}")
+    # Standard ARC-AGI-3 beginner games available in your environment
+    game_ids = ["ls20", "ar25", "bp35", "cd82", "cn04", "dc22", "ft09", "wa30"]
+    
+    print(f"Generating {num_trajectories} trajectories across {len(game_ids)} games...")
     
     for i in range(num_trajectories):
+        game_id = game_ids[i % len(game_ids)]
         # By setting save_recording=True, the engine natively dumps the JSONL we need
         env = arc.make(game_id, save_recording=True)
         obs = env.reset()
         
         # Play random actions until completion or timeout
-        max_steps = 100
+        max_steps = 50
         step = 0
         
         while step < max_steps:
@@ -147,17 +158,25 @@ def create_mock_trajectory(output_dir: str, num_trajectories: int = 5):
             
             # If the action requires coordinates, provide them via the 'data' kwarg
             if action_enum == GameAction.ACTION6:
-                # Assuming standard max safe bounds for random clicking
                 obs = env.step(action_enum, data={"x": random.randint(0, 30), "y": random.randint(0, 30)})
             else:
                 obs = env.step(action_enum)
                 
-            # If the engine says the game is won or over, break out
             if obs and obs.state in [GameState.WIN, GameState.GAME_OVER]:
                 break
-                
             step += 1
             
-        print(f"Trajectory {i+1} completed after {step} steps.")
-        
-    print(f"Recordings automatically saved by ARC-AGI to their default directory.")
+        print(f"Trajectory {i+1} ({game_id}) completed.")
+
+    # ARC-AGI saves recordings in its own scorecard directory. 
+    # We need to move them to the output_dir so our Dataset can find them.
+    import shutil
+    # The default location is usually under the current user's home or a relative 'recordings' dir
+    # Based on your log, it's relative to the run directory
+    local_recordings = Path("recordings")
+    if local_recordings.exists():
+        for jsonl_file in local_recordings.glob("**/*.jsonl"):
+            shutil.copy(jsonl_file, Path(output_dir) / jsonl_file.name)
+        print(f"Moved generated recordings to {output_dir}")
+    else:
+        print("Warning: Could not find generated recordings to move.")

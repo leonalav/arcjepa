@@ -70,7 +70,7 @@ def train():
     
     if not recording_files and is_main_process:
         print(f"No recordings found in {args.data_dir}. Generating real trajectories via ARC-AGI...")
-        create_mock_trajectory(args.data_dir, num_trajectories=5)
+        create_mock_trajectory(args.data_dir, num_trajectories=50)
         recording_files = list(data_path.glob("*.jsonl"))
         
     if world_size > 1: dist.barrier()
@@ -146,7 +146,6 @@ def train():
             if is_main_process and batch_idx == 0:
                 print(f"Processing first batch of epoch {epoch+1}...")
             
-            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             
             if args.deepspeed:

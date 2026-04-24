@@ -19,9 +19,10 @@ class JEPAPredictor(nn.Module):
                 nn.Linear(curr_dim, hidden_dim),
                 nn.LayerNorm(hidden_dim),
                 nn.GELU(),
+                nn.Dropout(0.1),
                 nn.Linear(hidden_dim, d_model)
             ])
-            curr_dim = d_model # Output of each sub-block is d_model
+            curr_dim = d_model
             
         self.mlp = nn.Sequential(*layers)
         self.norm = nn.LayerNorm(d_model)
