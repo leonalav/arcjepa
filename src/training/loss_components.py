@@ -160,13 +160,11 @@ class TemporalSpatialMask(nn.Module):
         changed_mask = (last_state != final_state).float()  # [B, H, W]
 
         # Apply differential weighting
+        # Note: If grid is completely static (changed_mask all zeros),
+        # this automatically evaluates to unchanged_weight (typically 1.0)
         weight_mask = (
             changed_mask * self.changed_weight +
             (1 - changed_mask) * self.unchanged_weight
         )
-
-        # Handle edge case: all zeros mask (static grid)
-        if weight_mask.sum() == 0:
-            weight_mask = torch.ones_like(weight_mask)
 
         return weight_mask

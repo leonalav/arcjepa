@@ -49,16 +49,17 @@ class ARCTrajectoryDataset(Dataset):
                     frame_data = json.loads(line)
                     trajectory.append(self._preprocess_frame(frame_data))
 
-            # Filter no-op trajectories if requested
-            if self.filter_noops and self._is_noop_trajectory(trajectory):
-                continue
-
             # Chunk the trajectory into sliding windows
             if len(trajectory) < 2: # Need at least (s_t, a_t, s_{t+1})
                 continue
 
             for i in range(0, len(trajectory) - self.window_size, self.stride):
                 chunk = trajectory[i : i + self.window_size + 1] # +1 for target state
+
+                # Filter no-op chunks (not trajectories) if requested
+                if self.filter_noops and self._is_noop_chunk(chunk):
+                    continue
+
                 self.chunks.append(chunk)
 
     def _preprocess_frame(self, frame_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -146,22 +147,22 @@ class ARCTrajectoryDataset(Dataset):
         """
         return (states != target_states).float()
 
-    def _is_noop_trajectory(self, trajectory: List[Dict]) -> bool:
+    def _is_noop_chunk(self, chunk: List[Dict]) -> bool:
         """
-        Check if a trajectory consists entirely of no-op transitions (all states identical).
+        Check if a specific chunk consists entirely of no-op transitions (all grids identical).
 
         Args:
-            trajectory: List of preprocessed frames
+            chunk: List of preprocessed frames in this sliding window
 
         Returns:
-            True if all transitions are no-ops, False otherwise
+            True if all grids in chunk are identical, False otherwise
         """
-        if len(trajectory) < 2:
+        if len(chunk) < 2:
             return True
 
-        # Check if all grids are identical
-        for i in range(len(trajectory) - 1):
-            if not torch.equal(trajectory[i]['grid'], trajectory[i + 1]['grid']):
+        first_grid = chunk[0]['grid']
+        for step in chunk[1:]:
+            if not torch.equal(first_grid, step['grid']):
                 return False
 
         return True
