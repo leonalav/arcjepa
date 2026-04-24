@@ -15,6 +15,10 @@ import random
 from .node import MCTSNode
 from .config import MCTSConfig
 from .utils import grid_accuracy
+from .grid_analysis import (
+    check_symmetry, check_completion, check_consistency,
+    measure_progress, object_level_accuracy, structural_similarity
+)
 
 
 class LatentMCTS:
@@ -64,7 +68,8 @@ class LatentMCTS:
         self,
         initial_state: torch.Tensor,
         initial_rnn_state: Optional[Any],
-        target_grid: torch.Tensor,
+        target_grid: Optional[torch.Tensor] = None,
+        input_grid: Optional[torch.Tensor] = None,
         num_simulations: Optional[int] = None
     ) -> Tuple[MCTSNode, Dict[str, Any]]:
         """
@@ -73,12 +78,18 @@ class LatentMCTS:
         Args:
             initial_state: Initial latent state [1, d_model]
             initial_rnn_state: Initial GDN recurrent cache
-            target_grid: Target grid to match [1, 64, 64]
+            target_grid: Target grid [1, 64, 64] (required for supervised mode)
+            input_grid: Input grid [1, 64, 64] (required for unsupervised mode)
             num_simulations: Number of simulations (overrides config)
 
         Returns:
             (root_node, search_stats)
         """
+        # Validate inputs based on mode
+        if self.config.evaluation_mode == "supervised" and target_grid is None:
+            raise ValueError("Supervised mode requires target_grid")
+        if self.config.evaluation_mode == "unsupervised" and input_grid is None:
+            raise ValueError("Unsupervised mode requires input_grid")
         num_sims = num_simulations or self.config.num_simulations
 
         # Create root node
@@ -113,7 +124,7 @@ class LatentMCTS:
                 # Check if we hit max depth
                 if depth >= self.config.max_depth:
                     # Evaluate and backpropagate without expansion
-                    reward = self._evaluate(node.s_t, target_grid)
+                    reward = self._evaluate(node.s_t, target_grid, input_grid)
                     node.backpropagate(reward)
                     self.stats["simulations_run"] += 1
                     continue
@@ -126,7 +137,7 @@ class LatentMCTS:
                         node = child  # Evaluate the new child
 
                 # Phase 3: Evaluation
-                reward = self._evaluate(node.s_t, target_grid)
+                reward = self._evaluate(node.s_t, target_grid, input_grid)
 
                 # Check for WIN condition
                 if reward >= 1.0 and not node.is_terminal:
@@ -210,15 +221,17 @@ class LatentMCTS:
 
         return child
 
-    def _evaluate(self, s_t: torch.Tensor, target_grid: torch.Tensor) -> float:
+    def _evaluate(self, s_t: torch.Tensor, target_grid: Optional[torch.Tensor] = None,
+                  input_grid: Optional[torch.Tensor] = None) -> float:
         """
         Phase 3: Evaluation.
 
-        Decode latent state and compare against target grid.
+        Decode latent state and evaluate quality.
 
         Args:
             s_t: Latent state [1, d_model]
-            target_grid: Target grid [1, 64, 64]
+            target_grid: Target grid [1, 64, 64] (for supervised mode)
+            input_grid: Input grid [1, 64, 64] (for unsupervised mode)
 
         Returns:
             Reward in [0.0, 1.0]
@@ -227,14 +240,67 @@ class LatentMCTS:
         logits = self.decoder(s_t)  # [1, 16, 64, 64]
         pred_grid = logits.argmax(dim=1)  # [1, 64, 64]
 
-        # Calculate accuracy
+        # Unsupervised evaluation (no target required)
+        if self.config.evaluation_mode == "unsupervised":
+            return self._evaluate_unsupervised(pred_grid, input_grid)
+
+        # Supervised evaluation (requires target)
+        if target_grid is None:
+            raise ValueError("Supervised evaluation requires target_grid")
+
         if self.config.reward_shaping == "binary":
             reward = grid_accuracy(pred_grid, target_grid)
+        elif self.config.reward_shaping == "shaped":
+            reward = self._evaluate_shaped(pred_grid, target_grid)
         else:
-            # Continuous reward shaping could be added here
             reward = grid_accuracy(pred_grid, target_grid)
 
         return reward
+
+    def _evaluate_unsupervised(self, pred_grid: torch.Tensor, input_grid: torch.Tensor) -> float:
+        """
+        Evaluate grid quality without target (for test-time inference).
+
+        Args:
+            pred_grid: Predicted grid [1, 64, 64]
+            input_grid: Input grid [1, 64, 64]
+
+        Returns:
+            Quality score in [0.0, 1.0]
+        """
+        pred = pred_grid.squeeze(0)  # [64, 64]
+        inp = input_grid.squeeze(0) if input_grid is not None else pred
+
+        # Heuristic quality metrics
+        symmetry_score = check_symmetry(pred)
+        completion_score = check_completion(pred)
+        consistency_score = check_consistency(pred, inp)
+
+        # Weighted combination
+        return 0.4 * symmetry_score + 0.3 * completion_score + 0.3 * consistency_score
+
+    def _evaluate_shaped(self, pred_grid: torch.Tensor, target_grid: torch.Tensor) -> float:
+        """
+        Evaluate with shaped rewards (progressive credit for partial completion).
+
+        Args:
+            pred_grid: Predicted grid [1, 64, 64]
+            target_grid: Target grid [1, 64, 64]
+
+        Returns:
+            Shaped reward in [0.0, 1.0]
+        """
+        pred = pred_grid.squeeze(0)  # [64, 64]
+        target = target_grid.squeeze(0)  # [64, 64]
+
+        # Multiple reward signals
+        pixel_acc = grid_accuracy(pred_grid, target_grid)
+        object_acc = object_level_accuracy(pred, target)
+        struct_sim = structural_similarity(pred, target)
+        progress = measure_progress(pred, target)
+
+        # Weighted combination
+        return 0.3 * pixel_acc + 0.3 * object_acc + 0.2 * struct_sim + 0.2 * progress
 
     def _predict_next_state(
         self,
@@ -376,28 +442,43 @@ class LatentMCTS:
     def solve_puzzle(
         self,
         input_grid: torch.Tensor,
-        target_grid: torch.Tensor,
-        num_simulations: Optional[int] = None
+        target_grid: Optional[torch.Tensor] = None,
+        num_simulations: Optional[int] = None,
+        mode: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         High-level interface to solve an ARC puzzle using MCTS.
 
         Args:
             input_grid: Input grid [1, 64, 64] or [64, 64]
-            target_grid: Target grid [1, 64, 64] or [64, 64]
+            target_grid: Target grid [1, 64, 64] or [64, 64] (optional for unsupervised)
             num_simulations: Number of MCTS simulations
+            mode: Override evaluation mode ("supervised" or "unsupervised")
 
         Returns:
             Dictionary with solution and statistics
         """
+        # Override mode if specified
+        original_mode = self.config.evaluation_mode
+        if mode is not None:
+            self.config.evaluation_mode = mode
+
+        # Validate mode requirements
+        if self.config.evaluation_mode == "supervised" and target_grid is None:
+            raise ValueError("Supervised mode requires target_grid. Use mode='unsupervised' for test-time inference.")
+
+        if self.config.evaluation_mode == "unsupervised" and target_grid is not None:
+            print("Warning: target_grid provided in unsupervised mode. It will be ignored during search.")
+
         # Ensure correct shapes
         if input_grid.dim() == 2:
             input_grid = input_grid.unsqueeze(0)
-        if target_grid.dim() == 2:
+        if target_grid is not None and target_grid.dim() == 2:
             target_grid = target_grid.unsqueeze(0)
 
         input_grid = input_grid.to(self.device)
-        target_grid = target_grid.to(self.device)
+        if target_grid is not None:
+            target_grid = target_grid.to(self.device)
 
         # Encode initial state
         with torch.no_grad():
@@ -416,7 +497,7 @@ class LatentMCTS:
             s_0_final = s_0_context.squeeze(1)  # [1, d_model]
 
         # Run MCTS search
-        root, stats = self.search(s_0_final, rnn_state_0, target_grid, num_simulations)
+        root, stats = self.search(s_0_final, rnn_state_0, target_grid, input_grid, num_simulations)
 
         # Extract best action sequence
         action_sequence = self.get_best_action_sequence(root)
@@ -431,8 +512,15 @@ class LatentMCTS:
             final_logits = self.decoder(best_node.s_t)
             final_grid = final_logits.argmax(dim=1)
 
-        # Calculate final accuracy
-        final_accuracy = grid_accuracy(final_grid, target_grid)
+        # Calculate final accuracy (if target available)
+        final_accuracy = None
+        success = False
+        if target_grid is not None:
+            final_accuracy = grid_accuracy(final_grid, target_grid)
+            success = final_accuracy >= 1.0
+
+        # Restore original mode
+        self.config.evaluation_mode = original_mode
 
         return {
             "action_sequence": action_sequence,
@@ -441,5 +529,6 @@ class LatentMCTS:
             "root_node": root,
             "best_node": best_node,
             "stats": stats,
-            "success": final_accuracy >= 1.0,
+            "success": success,
+            "mode": mode or original_mode,
         }

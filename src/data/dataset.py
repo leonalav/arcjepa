@@ -20,17 +20,23 @@ class ARCTrajectoryDataset(Dataset):
     provides sliding window chunks of (state, action) pairs.
     """
     def __init__(
-        self, 
-        recording_files: List[str], 
-        window_size: int = 24, 
+        self,
+        recording_files: List[str],
+        window_size: int = 24,
         stride: int = 4,
-        max_grid_size: int = 64  # Updated to 64 based on ARC-AGI-3 docs
+        max_grid_size: int = 64,  # Updated to 64 based on ARC-AGI-3 docs
+        multistep_k: int = 1,
+        compute_temporal_masks: bool = False,
+        filter_noops: bool = False
     ):
         self.window_size = window_size
         self.stride = stride
         self.max_grid_size = max_grid_size
+        self.multistep_k = multistep_k
+        self.compute_temporal_masks = compute_temporal_masks
+        self.filter_noops = filter_noops
         self.chunks = []
-        
+
         self._load_recordings(recording_files)
 
     def _load_recordings(self, recording_files: List[str]):
@@ -42,11 +48,15 @@ class ARCTrajectoryDataset(Dataset):
                         continue
                     frame_data = json.loads(line)
                     trajectory.append(self._preprocess_frame(frame_data))
-            
+
+            # Filter no-op trajectories if requested
+            if self.filter_noops and self._is_noop_trajectory(trajectory):
+                continue
+
             # Chunk the trajectory into sliding windows
             if len(trajectory) < 2: # Need at least (s_t, a_t, s_{t+1})
                 continue
-                
+
             for i in range(0, len(trajectory) - self.window_size, self.stride):
                 chunk = trajectory[i : i + self.window_size + 1] # +1 for target state
                 self.chunks.append(chunk)
@@ -99,15 +109,15 @@ class ARCTrajectoryDataset(Dataset):
 
     def __getitem__(self, idx):
         chunk = self.chunks[idx]
-        
+
         grids = torch.stack([step['grid'] for step in chunk])
         action_types = torch.tensor([step['action_type'] for step in chunk[:-1]], dtype=torch.long)
         xs = torch.tensor([step['x'] for step in chunk[:-1]], dtype=torch.long)
         ys = torch.tensor([step['y'] for step in chunk[:-1]], dtype=torch.long)
-        
+
         # Input: steps 0 to T-1 (grids and actions)
         # Target: steps 1 to T (grids for latent prediction)
-        return {
+        result = {
             'states': grids[:-1],          # [T, 64, 64]
             'actions': action_types,        # [T]
             'coords_x': xs,                 # [T]
@@ -115,6 +125,72 @@ class ARCTrajectoryDataset(Dataset):
             'target_states': grids[1:],     # [T, 64, 64]
             'final_state': grids[-1]        # [64, 64] (for reconstruction loss)
         }
+
+        # Compute temporal masks if requested
+        if self.compute_temporal_masks:
+            temporal_mask = self._compute_temporal_mask(grids[:-1], grids[1:])
+            result['temporal_mask'] = temporal_mask
+
+        return result
+
+    def _compute_temporal_mask(self, states: torch.Tensor, target_states: torch.Tensor) -> torch.Tensor:
+        """
+        Compute binary mask indicating which pixels changed between consecutive states.
+
+        Args:
+            states: [T, H, W] input states
+            target_states: [T, H, W] target states
+
+        Returns:
+            mask: [T, H, W] binary mask (1 = changed, 0 = unchanged)
+        """
+        return (states != target_states).float()
+
+    def _is_noop_trajectory(self, trajectory: List[Dict]) -> bool:
+        """
+        Check if a trajectory consists entirely of no-op transitions (all states identical).
+
+        Args:
+            trajectory: List of preprocessed frames
+
+        Returns:
+            True if all transitions are no-ops, False otherwise
+        """
+        if len(trajectory) < 2:
+            return True
+
+        # Check if all grids are identical
+        for i in range(len(trajectory) - 1):
+            if not torch.equal(trajectory[i]['grid'], trajectory[i + 1]['grid']):
+                return False
+
+        return True
+
+    def validate_arc_compliance(self):
+        """Validate dataset respects ARC-AGI-3 specifications"""
+        print(f"Validating {len(self.chunks)} chunks for ARC-AGI-3 compliance...")
+
+        for chunk_idx, chunk in enumerate(self.chunks):
+            for step_idx, step in enumerate(chunk):
+                grid = step['grid']
+
+                # Check grid size
+                assert grid.shape == (64, 64), \
+                    f"Chunk {chunk_idx}, Step {step_idx}: Invalid grid shape {grid.shape}"
+
+                # Check color range
+                assert grid.min() >= 0 and grid.max() <= 15, \
+                    f"Chunk {chunk_idx}, Step {step_idx}: Invalid color range [{grid.min()}, {grid.max()}]"
+
+                # Check action type
+                assert 0 <= step['action_type'] <= 8, \
+                    f"Chunk {chunk_idx}, Step {step_idx}: Invalid action type {step['action_type']}"
+
+                # Check coordinates
+                assert 0 <= step['x'] < 64 and 0 <= step['y'] < 64, \
+                    f"Chunk {chunk_idx}, Step {step_idx}: Invalid coords ({step['x']}, {step['y']})"
+
+        print(f"✓ Dataset validation passed: {len(self.chunks)} chunks comply with ARC-AGI-3 specs")
 
 def create_mock_trajectory(output_dir: str, num_trajectories: int = 5):
     """

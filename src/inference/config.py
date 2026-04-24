@@ -3,7 +3,7 @@ Configuration for MCTS search algorithm.
 """
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Any
 
 
 @dataclass
@@ -35,16 +35,21 @@ class MCTSConfig:
     early_stop_on_win: bool = True  # Stop search if perfect match found
 
     # Evaluation
-    reward_shaping: str = "binary"  # "binary" or "continuous"
+    reward_shaping: str = "binary"  # "binary", "shaped", or "unsupervised"
+    evaluation_mode: str = "supervised"  # "supervised" or "unsupervised"
 
     def __post_init__(self):
         if self.valid_actions is None:
             # Default: all 7 game actions (exclude SUBMIT=8 during search)
             self.valid_actions = [1, 2, 3, 4, 5, 6, 7]
 
-    def get_coordinate_samples(self, grid_size: int = 64) -> List[tuple]:
+    def get_coordinate_samples(self, grid_size: int = 64, current_grid: Optional[Any] = None) -> List[tuple]:
         """
         Generate coordinate samples based on sampling strategy.
+
+        Args:
+            grid_size: Size of the grid
+            current_grid: Optional current grid state for heuristic sampling
 
         Returns:
             List of (x, y) tuples to consider for actions.
@@ -62,9 +67,33 @@ class MCTSConfig:
             return coords
 
         elif self.coord_sampling == "heuristic":
-            # TODO: Implement heuristic-based coordinate selection
-            # For now, fall back to sparse
-            return self.get_coordinate_samples_sparse(grid_size)
+            # Content-aware sampling (requires current_grid)
+            if current_grid is None:
+                # Fall back to sparse if no grid provided
+                return self.get_coordinate_samples(grid_size)
+
+            # Import here to avoid circular dependency
+            from .grid_analysis import find_edges, find_frontier, find_symmetry_points
+
+            coords = set()
+
+            # Object boundaries
+            coords.update(find_edges(current_grid))
+
+            # Frontier cells
+            coords.update(find_frontier(current_grid))
+
+            # Symmetry points
+            coords.update(find_symmetry_points(current_grid))
+
+            # Always include corners and center
+            coords.update([
+                (0, 0), (0, grid_size-1),
+                (grid_size-1, 0), (grid_size-1, grid_size-1),
+                (grid_size//2, grid_size//2)
+            ])
+
+            return list(coords)
 
         else:
             raise ValueError(f"Unknown coord_sampling: {self.coord_sampling}")
