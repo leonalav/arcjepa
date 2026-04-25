@@ -60,7 +60,7 @@ def fast_mcts_config():
 class TestArchitecture:
     def test_model_shapes(self, device, small_model):
         batch_size = 2
-        T = 2
+        T = 4
         
         batch = {
             'states': torch.randint(0, 16, (batch_size, T, 64, 64)).to(device),
@@ -78,6 +78,7 @@ class TestArchitecture:
         assert outputs['pred_latents'].shape == (batch_size, expected_pred_steps, 32)
         assert outputs['target_latents'].shape == (batch_size, expected_pred_steps, 32)
         assert outputs['decoder_logits'].shape == (batch_size, 16, 64, 64)
+        assert outputs['policy_logits'].shape == (batch_size, expected_pred_steps, 137)
 
     def test_ema_update(self, device):
         model = ARCJEPAWorldModel(d_model=64).to(device)
@@ -130,6 +131,29 @@ class TestExtensions:
         output = predictor.forward_multistep(s_t_init, action_embeds, k=3)
         assert output.shape == (2, 3, 128)
 
+    def test_policy_loss(self, device):
+        criterion = ARCJPELoss()
+        
+        # Mock outputs
+        outputs = {
+            'pred_latents': torch.randn(2, 2, 32),
+            'target_latents': torch.randn(2, 2, 32),
+            'decoder_logits': torch.randn(2, 16, 64, 64),
+            'policy_logits': torch.randn(2, 2, 137)
+        }
+        
+        # Mock targets
+        targets = {
+            'final_state': torch.randint(0, 16, (2, 64, 64)),
+            'actions': torch.randint(0, 8, (2, 4)),
+            'coords_x': torch.randint(0, 64, (2, 4)),
+            'coords_y': torch.randint(0, 64, (2, 4))
+        }
+        
+        loss_dict = criterion(outputs.copy(), targets)
+        assert 'policy_loss' in loss_dict
+        assert loss_dict['policy_loss'] > 0
+
 # --- MCTS Tests ---
 
 class TestMCTS:
@@ -138,10 +162,23 @@ class TestMCTS:
         root = MCTSNode(s_t=s_t, rnn_state=None)
         assert root.visits == 0
         
-        child = MCTSNode(s_t=s_t, rnn_state=None, parent=root, action_taken=1)
+        # Test add_child with prior
+        child = root.add_child(action=1, coords=(10, 20), s_next=s_t, rnn_state_next=None, prior_p=0.5)
+        assert child.prior_p == 0.5
+        
         child.backpropagate(0.8)
         assert root.visits == 1
         assert root.total_value == 0.8
+
+    def test_node_expansion_top_k(self):
+        s_t = torch.randn(1, 32)
+        node = MCTSNode(s_t=s_t)
+        assert not node.is_fully_expanded(top_k=5)
+        
+        for i in range(5):
+            node.add_child(action=1, coords=(i, i), s_next=s_t, rnn_state_next=None)
+            
+        assert node.is_fully_expanded(top_k=5)
 
     def test_search_supervised(self, device, small_model, fast_mcts_config):
         mcts = LatentMCTS(small_model, fast_mcts_config, device)
@@ -176,11 +213,16 @@ class TestGridAnalysis:
     def test_shaped_rewards(self):
         pred = torch.zeros(64, 64, dtype=torch.long)
         target = torch.zeros(64, 64, dtype=torch.long)
-        target[10:20, 10:20] = 1
+        target[10:20, 10:20] = 1 # Object 1
+        target[30:40, 30:40] = 2 # Object 2
         
-        # Partial overlap
+        # Partial overlap on Object 1 (IoU=0.5, threshold is >0.5, so 0 matches)
         pred[10:15, 10:20] = 1
+        # Perfect match on Object 2 (IoU=1.0, 1 match)
+        pred[30:40, 30:40] = 2
+        
         obj_acc = object_level_accuracy(pred, target)
+        # Should be 0.5 (1 match / 2 targets)
         assert 0.0 < obj_acc < 1.0
 
 if __name__ == "__main__":

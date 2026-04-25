@@ -51,10 +51,13 @@ def train():
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size per GPU")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--context_ratio", type=float, default=0.3)
+    parser.add_argument("--context_ratio", type=float, default=0.7)
+    parser.add_argument("--use_curriculum", action="store_true", help="Use curriculum learning for context ratio")
+    parser.add_argument("--curriculum_start", type=float, default=0.9, help="Starting context ratio for curriculum")
+    parser.add_argument("--curriculum_end", type=float, default=0.5, help="Ending context ratio for curriculum")
     parser.add_argument("--data_dir", type=str, default=str(PROJECT_ROOT / "data" / "recordings"))
     parser.add_argument("--output_dir", type=str, default=str(PROJECT_ROOT / "checkpoints"))
-    parser.add_argument("--recon_weight", type=float, default=0.1)
+    parser.add_argument("--recon_weight", type=float, default=0.01)
     parser.add_argument("--deepspeed", action="store_true", help="Use DeepSpeed for training")
     parser.add_argument("--local_rank", type=int, default=-1, help="Local rank for distributed training")
 
@@ -68,7 +71,7 @@ def train():
     parser.add_argument("--compute_temporal_masks", action="store_true", help="Compute temporal masks for focal loss")
     parser.add_argument("--temporal_weight", type=float, default=10.0, help="Weight multiplier for changed pixels")
     parser.add_argument("--filter_noops", action="store_true", help="Filter no-op trajectories from dataset")
-    parser.add_argument("--num_trajectories", type=int, default=500, help="Number of trajectories to generate")
+    parser.add_argument("--num_trajectories", type=int, default=1000, help="Number of trajectories to generate")
     parser.add_argument("--logger", type=str, default="csv", choices=["wandb", "tensorboard", "csv"], help="Logging backend")
 
     args = parser.parse_args()
@@ -86,14 +89,17 @@ def train():
     # Wait for directory creation if multi-gpu
     if world_size > 1: dist.barrier()
     
-    recording_files = list(data_path.glob("*.jsonl"))
-    
-    if not recording_files and is_main_process:
+    # Check if files exist and generate if necessary (Main process only)
+    if is_main_process and not list(data_path.glob("*.jsonl")):
         print(f"No recordings found in {args.data_dir}. Generating real trajectories via ARC-AGI...")
         create_mock_trajectory(args.data_dir, num_trajectories=args.num_trajectories)
-        recording_files = list(data_path.glob("*.jsonl"))
         
+    # ALL processes wait for generation to finish
     if world_size > 1: dist.barrier()
+    
+    # CRITICAL: ALL processes re-read the directory after potential generation
+    recording_files = list(data_path.glob("*.jsonl"))
+    
     if not recording_files:
         recording_files = list(PROJECT_ROOT.glob("**/*.jsonl"))
         
@@ -125,7 +131,12 @@ def train():
     )
 
     # 2. Initialize Model & Components
-    model = ARCJEPAWorldModel(d_model=256, multistep_k=args.multistep_k).to(device)
+    model = ARCJEPAWorldModel(
+        d_model=512,  # Increased from 256
+        num_vit_layers=6,  # Increased from 4
+        num_gdn_heads=8,  # Increased from 4
+        multistep_k=args.multistep_k
+    ).to(device)
     
     # DeepSpeed Integration (Optional)
     if args.deepspeed:
@@ -209,21 +220,31 @@ def train():
         if sampler: sampler.set_epoch(epoch)
         total_loss = 0
 
+        # Curriculum learning for context ratio
+        if args.use_curriculum:
+            progress = epoch / args.epochs
+            context_ratio = args.curriculum_start - progress * (args.curriculum_start - args.curriculum_end)
+            context_ratio = max(args.curriculum_end, context_ratio)
+        else:
+            context_ratio = args.context_ratio
+
         for batch_idx, batch in enumerate(dataloader):
             if is_main_process and batch_idx == 0:
                 print(f"Processing first batch of epoch {epoch+1}...")
+                if args.use_curriculum:
+                    print(f"  Context ratio: {context_ratio:.2f}")
 
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
             if args.deepspeed:
-                outputs = model(batch, context_ratio=args.context_ratio)
+                outputs = model(batch, context_ratio=context_ratio, use_teacher_forcing=True)
                 loss_dict = criterion(outputs, batch)
                 loss = loss_dict['loss']
                 model.backward(loss)
                 model.step()
             else:
                 optimizer.zero_grad()
-                outputs = model(batch, context_ratio=args.context_ratio)
+                outputs = model(batch, context_ratio=context_ratio, use_teacher_forcing=True)
                 loss_dict = criterion(outputs, batch)
                 loss = loss_dict['loss']
                 loss.backward()
@@ -270,7 +291,7 @@ def train():
 
                         # Print critical metrics
                         print(f"Epoch [{epoch+1}/{args.epochs}] Batch [{batch_idx}/{len(dataloader)}]")
-                        print(f"  Loss: {loss.item():.4f} | JEPA: {loss_dict['jepa_loss']:.4f} | Recon: {loss_dict['recon_loss']:.4f} | Std: {loss_dict['std_loss']:.4f}")
+                        print(f"  Loss: {loss.item():.4f} | JEPA: {loss_dict['jepa_loss']:.4f} | Recon: {loss_dict['recon_loss']:.4f} | Std: {loss_dict['std_loss']:.4f} | Policy: {loss_dict['policy_loss']:.4f}")
                         print(f"  Latent: std={latent_metrics['latent_std_mean']:.3f} rank={latent_metrics['effective_rank']:.1f} corr={latent_metrics['latent_correlation_max']:.3f}")
                         print(f"  Accuracy: pixel={pred_metrics['pixel_accuracy']:.3f} fg={pred_metrics['foreground_accuracy']:.3f} bg={pred_metrics['background_accuracy']:.3f}")
                         if args.compute_temporal_masks:

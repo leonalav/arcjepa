@@ -4,79 +4,126 @@ from typing import Optional
 
 class JEPAPredictor(nn.Module):
     """
-    Predictor Module: Maps current state s_t and action z_a to next state s_{t+1}.
-    Implements the z_a + s_t -> s_{t+1} logic.
+    Paper-faithful JEPA Predictor with increased capacity.
+
+    Predicts next state s_{t+1} from current state s_t and action z_a.
+
+    Key improvements over original:
+    - 6 layers (vs 2) for increased capacity
+    - Transformer architecture (vs MLP) for sequence modeling
+    - NO residual connection to force learning
+    - Concatenate state+action (vs add) to preserve information
+    - Positional encoding for sequence awareness
+
+    Complexity: O(T^2 * d) per forward pass, but T is small (1-7 steps with teacher forcing)
     """
-    def __init__(self, d_model: int, num_layers: int = 2, hidden_dim: Optional[int] = None):
+    def __init__(
+        self,
+        d_model: int,
+        num_layers: int = 6,
+        num_heads: int = 8,
+        dim_feedforward: Optional[int] = None,
+        dropout: float = 0.1,
+        max_seq_len: int = 100
+    ):
         super().__init__()
-        if hidden_dim is None:
-            hidden_dim = d_model * 2
-            
-        layers = []
-        curr_dim = d_model
-        for i in range(num_layers):
-            layers.extend([
-                nn.Linear(curr_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),
-                nn.GELU(),
-                nn.Dropout(0.1),
-                nn.Linear(hidden_dim, d_model)
-            ])
-            curr_dim = d_model
-            
-        self.mlp = nn.Sequential(*layers)
-        self.norm = nn.LayerNorm(d_model)
+        self.d_model = d_model
 
-    def forward(self, s_t: torch.Tensor, z_a: torch.Tensor) -> torch.Tensor:
+        if dim_feedforward is None:
+            dim_feedforward = d_model * 4
+
+        # Input projection: concatenate state + action (preserve information)
+        self.input_proj = nn.Linear(d_model * 2, d_model)
+
+        # Learnable positional encoding
+        self.pos_embed = nn.Parameter(torch.zeros(1, max_seq_len, d_model))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+        # Transformer encoder with causal attention
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=num_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+            activation='gelu'
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # Output projection (NO RESIDUAL CONNECTION - force learning)
+        self.output_proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model)
+        )
+
+    def forward(
+        self,
+        s_t: torch.Tensor,
+        z_a: torch.Tensor,
+        step_idx: int = 0
+    ) -> torch.Tensor:
         """
-        s_t: [Batch, T, d_model]
-        z_a: [Batch, T, d_model]
-        Returns: [Batch, T, d_model] predicted s_{t+1}
+        Predict s_{t+1} from s_t and action z_a.
+
+        Args:
+            s_t: Current state latent [B, T, d_model]
+            z_a: Action embedding [B, T, d_model]
+            step_idx: Position in sequence for positional encoding
+
+        Returns:
+            s_next: Predicted next state [B, T, d_model]
         """
-        # We use additive conditioning as suggested
-        x = s_t + z_a
+        B, T, D = s_t.shape
 
-        # Apply MLP to predict the delta or the absolute next state
-        # Here we predict the next state directly
-        s_next_pred = self.mlp(x)
+        # Concatenate state and action (preserve both)
+        x = torch.cat([s_t, z_a], dim=-1)  # [B, T, 2*d_model]
+        x = self.input_proj(x)              # [B, T, d_model]
 
-        # Add residual connection from s_t
-        return self.norm(s_next_pred + s_t)
+        # Add positional encoding
+        pos = self.pos_embed[:, step_idx:step_idx+T, :]
+        x = x + pos
+
+        # Transformer processing with causal mask
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(T, device=x.device)
+        x = self.transformer(x, mask=causal_mask)
+
+        # Output projection (NO residual - force learning)
+        s_next = self.output_proj(x)
+
+        return s_next
 
     def forward_multistep(
         self,
-        s_t: torch.Tensor,
-        action_embeds: torch.Tensor,
+        s_t: torch.Tensor,          # [B, d_model]
+        action_embeds: torch.Tensor, # [B, k, d_model]
         k: int
     ) -> torch.Tensor:
         """
-        Multi-step rollout: predict k steps into the future without intermediate supervision.
+        Multi-step rollout for auxiliary loss.
+        Predicts k steps into future without intermediate supervision.
 
         Args:
-            s_t: [Batch, d_model] initial state latent
-            action_embeds: [Batch, k, d_model] action embeddings for next k steps
-            k: number of steps to predict
+            s_t: Initial state [B, d_model]
+            action_embeds: Action embeddings for k steps [B, k, d_model]
+            k: Number of steps to predict
 
         Returns:
-            predictions: [Batch, k, d_model] predicted latents at [t+1, t+2, ..., t+k]
+            predictions: [B, k, d_model] predicted latents at [t+1, t+2, ..., t+k]
         """
         predictions = []
-        s_curr = s_t  # [Batch, d_model]
+        s_curr = s_t  # [B, d_model]
 
         for i in range(k):
-            # Get action embedding for this step
-            z_a = action_embeds[:, i, :]  # [Batch, d_model]
+            z_a = action_embeds[:, i, :]  # [B, d_model]
 
-            # Predict next state (single-step forward)
-            # Need to add time dimension for forward compatibility
-            s_curr_expanded = s_curr.unsqueeze(1)  # [Batch, 1, d_model]
-            z_a_expanded = z_a.unsqueeze(1)  # [Batch, 1, d_model]
+            # Single-step prediction
+            s_curr_exp = s_curr.unsqueeze(1)  # [B, 1, d_model]
+            z_a_exp = z_a.unsqueeze(1)        # [B, 1, d_model]
 
-            s_next = self.forward(s_curr_expanded, z_a_expanded)  # [Batch, 1, d_model]
-            s_next = s_next.squeeze(1)  # [Batch, d_model]
+            s_next = self.forward(s_curr_exp, z_a_exp, step_idx=i)
+            s_next = s_next.squeeze(1)  # [B, d_model]
 
             predictions.append(s_next)
-            s_curr = s_next  # Update current state for next iteration
+            s_curr = s_next  # Autoregressive
 
-        # Stack predictions: [Batch, k, d_model]
-        return torch.stack(predictions, dim=1)
+        return torch.stack(predictions, dim=1)  # [B, k, d_model]

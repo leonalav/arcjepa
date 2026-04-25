@@ -75,92 +75,129 @@ class ARCJEPAWorldModel(nn.Module):
         latents = encoder(x) # [BT, d_model]
         return latents.reshape(b, t, self.d_model)
 
-    def forward(self, batch: Dict[str, torch.Tensor], context_ratio: float = 0.3) -> Dict[str, torch.Tensor]:
+    def forward(
+        self,
+        batch: Dict[str, torch.Tensor],
+        context_ratio: float = 0.7,
+        use_teacher_forcing: bool = True
+    ) -> Dict[str, torch.Tensor]:
         """
-        context_ratio: The percentage of the trajectory provided as ground-truth context.
-                       The model must auto-regressively predict the rest.
+        Forward pass with teacher forcing and no GDN feedback loop.
+
+        Key changes from original:
+        - Teacher forcing: use ground truth states as predictor input
+        - GDN only for context processing, NOT in prediction loop
+        - Store RAW predictor outputs for loss (no GDN processing)
+        - Increased default context_ratio from 0.3 to 0.7
+
+        Args:
+            batch: Dictionary with states, actions, coords, target_states
+            context_ratio: Fraction of sequence used as context (default 0.7)
+            use_teacher_forcing: Use ground truth states during training (default True)
+
+        Returns:
+            Dictionary with pred_latents, target_latents, decoder_logits, policy_logits
         """
         states = batch['states']              # [B, T, 64, 64]
         actions = batch['actions']            # [B, T]
         cx, cy = batch['coords_x'], batch['coords_y']
         target_grids = batch['target_states'] # [B, T, 64, 64]
-        
+
         B, T = states.shape[:2]
-        
-        # 1. Determine Context Window (K) vs Prediction Window
         K = max(1, int(T * context_ratio))
-        
-        # 2. Encode Context States (Online)
-        # We only encode the first K states. The model is BLIND to states K through T.
-        s_context = self.encode(states[:, :K], self.online_encoder) # [B, K, d_model]
-        
-        # 3. Build initial temporal state using GDN
-        # We get the context features and the RNN hidden state at time K
-        s_context_features, rnn_state = self.gdn(s_context, use_cache=True) 
-        
-        # 4. Auto-regressive Latent Rollout
-        pred_latents = []
-        
-        # The predictor starts from the last valid context feature
-        curr_state = s_context_features[:, -1] # [B, d_model]
-        
-        for t in range(K, T):
-            # Embed the action for step t
-            z_a_t = self.action_embed(actions[:, t], cx[:, t], cy[:, t]) # [B, d_model]
 
-            # ALWAYS compute the 1-step prediction for the main sequence
-            # This ensures pred_latents matches target_latents temporally
-            next_latent = self.predictor(curr_state.unsqueeze(1), z_a_t.unsqueeze(1)).squeeze(1)
-            pred_latents.append(next_latent)
+        # ═══════════════════════════════════════════════════════
+        # PHASE 1: CONTEXT ENCODING (with GDN)
+        # ═══════════════════════════════════════════════════════
 
-            # --- MULTI-STEP AUXILIARY BRANCH ---
-            # We compute this once per batch (at the transition t=K) to provide
-            # long-term gradients while avoiding breaking the temporal RNN chain.
-            if self.multistep_k > 1 and t == K and (t + self.multistep_k <= T):
+        # Encode context states with online encoder
+        s_context = self.encode(states[:, :K], self.online_encoder)  # [B, K, d_model]
+
+        # Process context with GDN for temporal features
+        s_context_features, _ = self.gdn(s_context, use_cache=True)
+
+        # ═══════════════════════════════════════════════════════
+        # PHASE 2: TEACHER-FORCED PREDICTION (NO GDN)
+        # ═══════════════════════════════════════════════════════
+
+        if use_teacher_forcing:
+            # TEACHER FORCING: Use ground truth states as input
+            # Encode ALL states (not just context)
+            all_states_encoded = self.encode(states[:, :T-1], self.online_encoder)  # [B, T-1, d_model]
+
+            # Prepare action embeddings for prediction window
+            action_embeds = []
+            for t in range(K-1, T-1):
+                z_a = self.action_embed(actions[:, t], cx[:, t], cy[:, t])
+                action_embeds.append(z_a)
+            action_embeds = torch.stack(action_embeds, dim=1)  # [B, T-K, d_model]
+
+            # Batch prediction (efficient)
+            s_input = all_states_encoded[:, K-1:T-1]  # [B, T-K, d_model]
+            pred_latents = self.predictor(s_input, action_embeds, step_idx=K-1)  # [B, T-K, d_model]
+
+            # Multi-step prediction (auxiliary)
+            if self.multistep_k > 1 and K-1 + self.multistep_k <= T:
+                s_init = all_states_encoded[:, K-1]  # [B, d_model]
                 action_embeds_k = []
                 for i in range(self.multistep_k):
-                    z_a_i = self.action_embed(actions[:, t + i], cx[:, t + i], cy[:, t + i])
-                    action_embeds_k.append(z_a_i)
-                
-                action_embeds_k = torch.stack(action_embeds_k, dim=1)  # [B, k, d_model]
-                
-                # Rollout k steps into the future without GDN feedback
-                multistep_preds = self.predictor.forward_multistep(
-                    curr_state, action_embeds_k, self.multistep_k
-                )  # [B, k, d_model]
-                
-                multistep_pred_latents = multistep_preds
-            # ------------------------------------
+                    z_a = self.action_embed(actions[:, K-1+i], cx[:, K-1+i], cy[:, K-1+i])
+                    action_embeds_k.append(z_a)
+                action_embeds_k = torch.stack(action_embeds_k, dim=1)
 
-            # To predict the step AFTER next, we feed our 1-STEP prediction back into the GDN
-            # to reliably update the temporal RNN state
-            if t < T - 1:
-                next_latent_seq = next_latent.unsqueeze(1)
-                gdn_out, rnn_state = self.gdn(next_latent_seq, state=rnn_state, use_cache=True)
-                curr_state = gdn_out.squeeze(1) # [B, d_model]
-                
-        pred_latents = torch.stack(pred_latents, dim=1) # [B, T-K, d_model]
+                multistep_pred_latents = self.predictor.forward_multistep(
+                    s_init, action_embeds_k, self.multistep_k
+                )
+            else:
+                multistep_pred_latents = None
 
-        # 5. Encode target states (Target EMA) - No gradient
+        else:
+            # AUTOREGRESSIVE: Use previous predictions (inference mode)
+            pred_latents = []
+            curr_state = s_context_features[:, -1]  # [B, d_model]
+
+            for t in range(K-1, T-1):
+                z_a = self.action_embed(actions[:, t], cx[:, t], cy[:, t])
+
+                # Predict next state (NO GDN processing)
+                s_next_pred = self.predictor(
+                    curr_state.unsqueeze(1),
+                    z_a.unsqueeze(1),
+                    step_idx=t
+                ).squeeze(1)
+
+                pred_latents.append(s_next_pred)
+                curr_state = s_next_pred  # Autoregressive
+
+            pred_latents = torch.stack(pred_latents, dim=1)
+            multistep_pred_latents = None
+
+        # ═══════════════════════════════════════════════════════
+        # PHASE 3: TARGET ENCODING (EMA)
+        # ═══════════════════════════════════════════════════════
+
         with torch.no_grad():
-            # We only calculate target latents for the steps we predicted
-            s_next_target = self.encode(target_grids[:, K:T], self.target_encoder) # [B, T-K, d_model]
+            # Encode target states with target encoder (raw embeddings)
+            s_next_target = self.encode(target_grids[:, K:T], self.target_encoder)  # [B, T-K, d_model]
 
-            # For multi-step mode, encode target at t+k
+            # Multi-step targets
             if self.multistep_k > 1 and K + self.multistep_k <= T:
                 multistep_target_latents = self.encode(
                     target_grids[:, K:K+self.multistep_k],
                     self.target_encoder
-                )  # [B, k, d_model]
+                )
             else:
                 multistep_target_latents = None
 
-        # 6. Decode final predicted state for reconstruction loss
-        # Decode the very last hallucinated state to see if it matches the true final grid
-        final_state_logits = self.decoder(pred_latents[:, -1]) # [B, 16, 64, 64]
+        # ═══════════════════════════════════════════════════════
+        # PHASE 4: AUXILIARY OUTPUTS
+        # ═══════════════════════════════════════════════════════
 
-        # 7. Compute Policy Logits (action/x/y predictions for training the search policy)
-        policy_logits = self.policy_head(pred_latents) # [B, T-K, 9+64+64]
+        # Decode final predicted state
+        final_state_logits = self.decoder(pred_latents[:, -1])
+
+        # Policy logits
+        policy_logits = self.policy_head(pred_latents)
 
         output = {
             'pred_latents': pred_latents,
@@ -169,8 +206,7 @@ class ARCJEPAWorldModel(nn.Module):
             'policy_logits': policy_logits
         }
 
-        # Add multi-step predictions if available
-        if self.multistep_k > 1 and 'multistep_pred_latents' in locals():
+        if multistep_pred_latents is not None:
             output['multistep_pred_latents'] = multistep_pred_latents
             output['multistep_target_latents'] = multistep_target_latents
 

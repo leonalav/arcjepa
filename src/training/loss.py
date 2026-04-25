@@ -11,7 +11,7 @@ class ARCJPELoss(nn.Module):
     """
     def __init__(
         self,
-        recon_weight: float = 0.1,
+        recon_weight: float = 0.01,  # Reduced from 0.1
         use_vicreg: bool = False,
         vicreg_weight: float = 1.0,
         use_focal: bool = False,
@@ -47,8 +47,9 @@ class ARCJPELoss(nn.Module):
         decoder_logits = outputs['decoder_logits']
         final_state_gt = targets['final_state']
 
-        # 1. JEPA Loss (MSE)
-        # We want predicted next latent to match target latent
+        # 1. JEPA Loss (MSE for stronger gradients)
+        # MSE provides stronger gradients than L1 for small errors
+        # Paper citation: I-JEPA uses L2 loss
         jepa_loss = F.mse_loss(pred_latents, target_latents)
 
         # 2. Reconstruction Loss (CrossEntropy or Focal)
@@ -71,9 +72,16 @@ class ARCJPELoss(nn.Module):
             focal_loss = 0.0
 
         # 3. Variance Regularization (VICReg-style to prevent collapse)
-        # Force the standard deviation of latents across the batch to be > 0.1
-        std_target = torch.sqrt(target_latents.var(dim=0) + 1e-04)
-        std_loss = torch.mean(F.relu(0.1 - std_target))
+        # Flatten [B, T, D] to [B*T, D] to ensure sufficient samples
+        flat_target = target_latents.reshape(-1, target_latents.size(-1))
+        flat_pred = pred_latents.reshape(-1, pred_latents.size(-1))
+        
+        # Calculate variance with unbiased=False (correction=0) to prevent NaN on small batches
+        std_target = torch.sqrt(flat_target.var(dim=0, unbiased=False) + 1e-04)
+        std_online = torch.sqrt(flat_pred.var(dim=0, unbiased=False) + 1e-04)
+        
+        # Increase threshold from 0.1 to 1.0 (VICReg standard)
+        std_loss = torch.mean(F.relu(1.0 - std_target)) + torch.mean(F.relu(1.0 - std_online))
 
         # 4. Policy Loss (AlphaZero-style supervised policy training)
         policy_logits = outputs['policy_logits'] # [B, T-K, 137]
@@ -94,7 +102,8 @@ class ARCJPELoss(nn.Module):
         l_x = F.cross_entropy(x_logits.flatten(0, 1), gt_x.flatten())
         l_y = F.cross_entropy(y_logits.flatten(0, 1), gt_y.flatten())
         
-        policy_loss = l_action + l_x + l_y
+        # Scale policy loss down to 0.01 so it doesn't dominate the JEPA objective
+        policy_loss = (l_action + l_x + l_y) * 0.01
 
         # 5. Covariance Regularization (VICReg extension)
         if self.use_vicreg:

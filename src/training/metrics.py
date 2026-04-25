@@ -22,7 +22,8 @@ def compute_latent_metrics(target_latents: torch.Tensor) -> Dict[str, float]:
         latents = target_latents
 
     # Standard deviation statistics
-    std_per_dim = torch.std(latents, dim=0)
+    # Use correction=0 (biased) to prevent NaN on single-sample shards
+    std_per_dim = torch.std(latents, dim=0, correction=0)
     latent_std_mean = std_per_dim.mean().item()
     latent_std_min = std_per_dim.min().item()
     latent_std_max = std_per_dim.max().item()
@@ -32,7 +33,9 @@ def compute_latent_metrics(target_latents: torch.Tensor) -> Dict[str, float]:
 
     # Effective rank via eigenvalue entropy
     latents_centered = latents - latents.mean(dim=0, keepdim=True)
-    cov_matrix = (latents_centered.T @ latents_centered) / (latents.shape[0] - 1)
+    # Using N (biased) for stability
+    N = latents.shape[0]
+    cov_matrix = (latents_centered.T @ latents_centered) / N
 
     try:
         eigenvalues = torch.linalg.eigvalsh(cov_matrix)
@@ -109,7 +112,13 @@ def compute_prediction_metrics(
 
     # Changed vs unchanged pixel accuracy (if temporal mask provided)
     if temporal_mask is not None:
-        changed_mask = (temporal_mask > 0.5)
+        # If temporal_mask is a trajectory [B, T, H, W], take the last step matching final_state
+        if temporal_mask.dim() == 4:
+            curr_mask = temporal_mask[:, -1]
+        else:
+            curr_mask = temporal_mask
+
+        changed_mask = (curr_mask > 0.5)
         unchanged_mask = ~changed_mask
 
         if changed_mask.any():

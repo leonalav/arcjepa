@@ -29,8 +29,6 @@ class VICRegCovarianceLoss(nn.Module):
             latents = target_latents
 
         N = latents.shape[0]
-
-        # Handle edge case: batch size of 1
         if N <= 1:
             return torch.tensor(0.0, device=latents.device)
 
@@ -38,7 +36,8 @@ class VICRegCovarianceLoss(nn.Module):
         latents_centered = latents - latents.mean(dim=0, keepdim=True)
 
         # Compute covariance matrix: [D, D]
-        cov_matrix = (latents_centered.T @ latents_centered) / (N - 1)
+        # Using N (biased) for stability with small batches
+        cov_matrix = (latents_centered.T @ latents_centered) / N
 
         # Penalize off-diagonal elements
         # off_diag_loss = sum(cov^2) - sum(diag(cov)^2)

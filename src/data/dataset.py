@@ -80,14 +80,17 @@ class ARCTrajectoryDataset(Dataset):
         padded_grid[:safe_h, :safe_w] = grid[:safe_h, :safe_w]
         
         # Action parsing (Compliant with Official arcengine format)
-        action_data = frame_data.get('action_input', {})
+        # Use 'or {}' to handle cases where 'action_input' might be explicitly set to null
+        action_data = frame_data.get('action_input') or {}
+        
         if isinstance(action_data, str):
             action_type = action_data
             ax, ay = 0, 0
         else:
             action_type = action_data.get('action', 'NONE')
-            ax = action_data.get('x', 0)
-            ay = action_data.get('y', 0)
+            # Clamp coordinates to [0, max_grid_size-1] to prevent IndexError in cross-entropy loss
+            ax = max(0, min(int(action_data.get('x', 0)), self.max_grid_size - 1))
+            ay = max(0, min(int(action_data.get('y', 0)), self.max_grid_size - 1))
             
         # Map action type to index (ACTION1-7 -> 1-7, SUBMIT -> 8, others 0)
         action_idx = 0
@@ -193,67 +196,123 @@ class ARCTrajectoryDataset(Dataset):
 
         print(f"✓ Dataset validation passed: {len(self.chunks)} chunks comply with ARC-AGI-3 specs")
 
-def create_mock_trajectory(output_dir: str, num_trajectories: int = 5):
+def create_mock_trajectory(
+    output_dir: str,
+    num_trajectories: int = 1000,
+    min_state_changes: int = 5,
+    min_fg_ratio: float = 0.1,
+    max_attempts: int = 5000
+):
     """
-    Utility to create authentic ARC-AGI-3 JSONL trajectories.
-    Instead of hallucinating data, we use the official engine to play a random game
-    and leverage its built-in recording functionality.
+    Generate meaningful ARC trajectories using heuristic policy.
+
+    Instead of random actions, uses pattern detection to create trajectories
+    with causal structure and meaningful state transitions.
+
+    Args:
+        output_dir: Directory to save recordings
+        num_trajectories: Target number of valid trajectories
+        min_state_changes: Minimum state changes to keep trajectory
+        min_fg_ratio: Minimum foreground ratio to keep trajectory
+        max_attempts: Maximum generation attempts
     """
+    from .heuristic_policy import ARCHeuristicPolicy
+    import shutil
+
     Path(output_dir).mkdir(parents=True, exist_ok=True)
-    
+
     # Define a local directory for ARC environments
     env_dir = PROJECT_ROOT / "data" / "arc_environments"
     env_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Instantiate the official Arcade entry point
     arc = arc_agi.Arcade(environments_dir=str(env_dir))
-    
-    # Standard ARC-AGI-3 beginner games
-    game_ids = ["ls20", "v750", "d963", "t432", "b210"]
-    
-    # Standard ARC-AGI-3 beginner games available in your environment
-    game_ids = ["ls20", "ar25", "bp35", "cd82", "cn04", "dc22", "ft09", "wa30"]
-    
-    print(f"Generating {num_trajectories} trajectories across {len(game_ids)} games...")
-    
-    for i in range(num_trajectories):
-        game_id = game_ids[i % len(game_ids)]
-        # By setting save_recording=True, the engine natively dumps the JSONL we need
-        env = arc.make(game_id, save_recording=True)
-        obs = env.reset()
-        
-        # Play random actions until completion or timeout
-        max_steps = 50
-        step = 0
-        
-        while step < max_steps:
-            # Pick a random action type
-            action_enum = random.choice([
-                GameAction.ACTION1, GameAction.ACTION2, GameAction.ACTION3, 
-                GameAction.ACTION4, GameAction.ACTION5, GameAction.ACTION6
-            ])
-            
-            # If the action requires coordinates, provide them via the 'data' kwarg
-            if action_enum == GameAction.ACTION6:
-                obs = env.step(action_enum, data={"x": random.randint(0, 30), "y": random.randint(0, 30)})
-            else:
-                obs = env.step(action_enum)
-                
-            if obs and obs.state in [GameState.WIN, GameState.GAME_OVER]:
-                break
-            step += 1
-            
-        print(f"Trajectory {i+1} ({game_id}) completed.")
 
-    # ARC-AGI saves recordings in its own scorecard directory. 
-    # We need to move them to the output_dir so our Dataset can find them.
-    import shutil
-    # The default location is usually under the current user's home or a relative 'recordings' dir
-    # Based on your log, it's relative to the run directory
+    # Standard ARC-AGI-3 beginner games
+    game_ids = ["ls20", "ar25", "bp35", "cd82", "cn04", "dc22", "ft09", "wa30"]
+
+    # Initialize heuristic policy
+    policy = ARCHeuristicPolicy(exploration_rate=0.2)
+
+    successful = 0
+    attempts = 0
+
+    print(f"Generating {num_trajectories} trajectories with heuristic policy...")
+    print(f"Filters: min_changes={min_state_changes}, min_fg={min_fg_ratio}")
+
+    while successful < num_trajectories and attempts < max_attempts:
+        game_id = game_ids[attempts % len(game_ids)]
+
+        try:
+            env = arc.make(game_id, save_recording=True)
+            obs = env.reset()
+
+            if obs is None or obs.grid is None:
+                attempts += 1
+                continue
+
+            # Track trajectory quality
+            state_changes = 0
+            prev_grid = obs.grid.copy()
+            max_fg_ratio = 0.0
+            step = 0
+            max_steps = 50
+
+            while step < max_steps:
+                if obs is None or obs.grid is None:
+                    break
+
+                # Select action using heuristic policy
+                action_enum, x, y = policy.select_action(obs.grid, step)
+
+                # Execute action
+                if action_enum == GameAction.ACTION6:
+                    obs = env.step(action_enum, data={"x": x, "y": y})
+                else:
+                    obs = env.step(action_enum)
+
+                # Track state changes
+                if obs and obs.grid is not None:
+                    if not np.array_equal(obs.grid, prev_grid):
+                        state_changes += 1
+
+                    # Track foreground ratio
+                    fg_ratio = np.mean(obs.grid != 0)
+                    max_fg_ratio = max(max_fg_ratio, fg_ratio)
+
+                    prev_grid = obs.grid.copy()
+
+                # Check termination
+                if obs and obs.state in [GameState.WIN, GameState.GAME_OVER]:
+                    break
+
+                step += 1
+
+            # Filter trajectory
+            if state_changes >= min_state_changes and max_fg_ratio >= min_fg_ratio:
+                successful += 1
+
+                if successful % 100 == 0:
+                    print(f"Progress: {successful}/{num_trajectories} valid trajectories")
+                    print(f"  Last trajectory: {state_changes} changes, {max_fg_ratio:.3f} fg_ratio")
+
+        except Exception as e:
+            print(f"Warning: Failed to generate trajectory {attempts}: {e}")
+
+        attempts += 1
+
+    # Move recordings to output directory
     local_recordings = Path("recordings")
     if local_recordings.exists():
+        moved = 0
         for jsonl_file in local_recordings.glob("**/*.jsonl"):
             shutil.copy(jsonl_file, Path(output_dir) / jsonl_file.name)
-        print(f"Moved generated recordings to {output_dir}")
-    else:
-        print("Warning: Could not find generated recordings to move.")
+            moved += 1
+        print(f"\nMoved {moved} recordings to {output_dir}")
+
+    print(f"\nGeneration complete:")
+    print(f"  Valid trajectories: {successful}/{num_trajectories}")
+    print(f"  Total attempts: {attempts}")
+    print(f"  Success rate: {successful/attempts*100:.1f}%")
+
+    return successful
