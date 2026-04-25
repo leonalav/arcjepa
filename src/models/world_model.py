@@ -62,6 +62,15 @@ class ARCJEPAWorldModel(nn.Module):
             nn.Linear(d_model, 9 + 64 + 64) # 9 actions + 64x + 64y
         )
 
+        # VICReg Projector (for disentangling features in a higher-dimensional space)
+        # This prevents the core latents from being too constrained by the covariance penalty
+        self.projector = nn.Sequential(
+            nn.Linear(d_model, 1024),
+            nn.LayerNorm(1024),
+            nn.ReLU(),
+            nn.Linear(1024, 1024)
+        )
+
     def encode(self, grids: torch.Tensor, encoder: nn.Module, max_batch_size: int = 2) -> torch.Tensor:
         """
         grids: [Batch, T, 64, 64]
@@ -223,9 +232,15 @@ class ARCJEPAWorldModel(nn.Module):
         # Policy logits
         policy_logits = self.policy_head(pred_latents)
 
+        # VICReg Projections (compute std/cov losses in higher dimension)
+        projected_pred_latents = self.projector(pred_latents)
+        projected_target_latents = self.projector(s_next_target)
+
         output = {
             'pred_latents': pred_latents,
             'target_latents': s_next_target,
+            'projected_pred_latents': projected_pred_latents,
+            'projected_target_latents': projected_target_latents,
             'decoder_logits': final_state_logits,
             'policy_logits': policy_logits
         }

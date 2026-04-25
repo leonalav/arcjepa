@@ -72,9 +72,13 @@ class ARCJPELoss(nn.Module):
             focal_loss = 0.0
 
         # 3. Variance Regularization (VICReg-style to prevent collapse)
+        # Apply to PROJECTED latents to allow core latents to remain flexible
+        projected_target = outputs.get('projected_target_latents', target_latents)
+        projected_pred = outputs.get('projected_pred_latents', pred_latents)
+
         # Flatten [B, T, D] to [B*T, D] to ensure sufficient samples
-        flat_target = target_latents.reshape(-1, target_latents.size(-1))
-        flat_pred = pred_latents.reshape(-1, pred_latents.size(-1))
+        flat_target = projected_target.reshape(-1, projected_target.size(-1))
+        flat_pred = projected_pred.reshape(-1, projected_pred.size(-1))
         
         # Calculate variance with unbiased=False (correction=0) to prevent NaN on small batches
         std_target = torch.sqrt(flat_target.var(dim=0, unbiased=False) + 1e-04)
@@ -102,12 +106,13 @@ class ARCJPELoss(nn.Module):
         l_x = F.cross_entropy(x_logits.flatten(0, 1), gt_x.flatten())
         l_y = F.cross_entropy(y_logits.flatten(0, 1), gt_y.flatten())
         
-        # Scale policy loss down to 0.01 so it doesn't dominate the JEPA objective
-        policy_loss = (l_action + l_x + l_y) * 0.01
+        # Scale policy loss so it provides meaningful gradient flow without overpowering JEPA
+        policy_loss = (l_action + l_x + l_y) * 0.25
 
         # 5. Covariance Regularization (VICReg extension)
         if self.use_vicreg:
-            cov_loss = self.vicreg_cov_loss(target_latents)
+            # Covariance loss is explicitly applied to the projector output
+            cov_loss = self.vicreg_cov_loss(projected_target)
         else:
             cov_loss = torch.tensor(0.0, device=target_latents.device)
 

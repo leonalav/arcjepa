@@ -5,16 +5,19 @@
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Use gradient checkpointing and mixed precision
-python train.py \
-    --deepspeed \
-    --batch_size 2 \
-    --epochs 100 \
-    --lr 1e-4 \
-    --context_ratio 0.7 \
-    --use_curriculum \
-    --recon_weight 0.01 \
-    --use_vicreg \
-    --multistep_k 1 \
-    --filter_noops \
-    --num_trajectories 1000 \
-    --logger csv
+deepspeed train.py \
+  --deepspeed \
+  --batch_size 2 \
+  --epochs 100 \
+  --lr 1e-4 \
+  --context_ratio 0.7 \
+  --recon_weight 1.0 \
+  --use_vicreg \
+  --vicreg_weight 25.0 \
+  --multistep_k 3 \
+  --use_focal \
+  --compute_temporal_masks \
+  --filter_noops \
+  --logger csv \
+  --num_trajectories 1000
+
