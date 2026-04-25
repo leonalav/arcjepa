@@ -38,8 +38,13 @@ def compute_latent_metrics(target_latents: torch.Tensor) -> Dict[str, float]:
     cov_matrix = (latents_centered.T @ latents_centered) / N
 
     try:
-        eigenvalues = torch.linalg.eigvalsh(cov_matrix)
-        eigenvalues = eigenvalues[eigenvalues > 1e-8]  # Filter numerical noise
+        # CRITICAL: eigvalsh is not implemented for float16 in PyTorch.
+        # During DeepSpeed mixed precision, this silently failed and returned 0.0.
+        eigenvalues = torch.linalg.eigvalsh(cov_matrix.to(torch.float32))
+        
+        # Filter numerical noise. Since sum of variances is ~25, noise is very small
+        eigenvalues = eigenvalues[eigenvalues > 1e-6]
+
 
         if len(eigenvalues) > 0:
             probs = eigenvalues / eigenvalues.sum()

@@ -21,7 +21,9 @@ class ARCJEPAWorldModel(nn.Module):
         num_vit_layers: int = 4,
         num_gdn_heads: int = 4,
         tau: float = 0.999,
-        multistep_k: int = 1
+        multistep_k: int = 1,
+        predictor_layers: int = 6,
+        predictor_bottleneck: int = 384
     ):
         super().__init__()
         self.d_model = d_model
@@ -41,8 +43,12 @@ class ARCJEPAWorldModel(nn.Module):
         # Temporal / Sequence Model
         self.gdn = GDNSequenceModel(d_model, n_heads=num_gdn_heads)
 
-        # Predictor
-        self.predictor = JEPAPredictor(d_model)
+        # Predictor (Lightweight MLP with bottleneck)
+        self.predictor = JEPAPredictor(
+            d_model=d_model,
+            num_layers=predictor_layers,
+            bottleneck_dim=predictor_bottleneck
+        )
 
         # Final State Decoder
         self.decoder = GridDecoder(d_model)
@@ -56,23 +62,40 @@ class ARCJEPAWorldModel(nn.Module):
             nn.Linear(d_model, 9 + 64 + 64) # 9 actions + 64x + 64y
         )
 
-    def encode(self, grids: torch.Tensor, encoder: nn.Module) -> torch.Tensor:
+    def encode(self, grids: torch.Tensor, encoder: nn.Module, max_batch_size: int = 2) -> torch.Tensor:
         """
         grids: [Batch, T, 64, 64]
         encoder: online_encoder or target_encoder
+        max_batch_size: number of individual frames to process at once through the ViT to prevent OOM.
         Returns: [Batch, T, d_model] latent states
         """
         b, t, h, w = grids.shape
         # Flatten time for spatial encoding
         grids = grids.reshape(b * t, h, w)
         
-        # Embed and add pos
-        x = self.grid_embed(grids) # [BT, H, W, d_model]
-        p = self.pos_embed(h, w)   # [H, W, d_model]
-        x = x + p.unsqueeze(0)
-        
-        # Spatial encoding
-        latents = encoder(x) # [BT, d_model]
+        all_latents = []
+        # Process in chunks to prevent O(N^2) self-attention from OOMing the GPU
+        for i in range(0, b * t, max_batch_size):
+            chunk = grids[i : i + max_batch_size]
+            
+            # Embed and add pos
+            x = self.grid_embed(chunk) # [MB, H, W, d_model]
+            p = self.pos_embed(h, w)   # [H, W, d_model]
+            x = x + p.unsqueeze(0)
+            
+            # Spatial encoding (Memory bottleneck)
+            # CRITICAL: We MUST use gradient checkpointing here. 
+            # Otherwise, PyTorch stores the massive O(N^2) attention activations 
+            # for EVERY chunk for the backward pass, causing an inevitable OOM.
+            if x.requires_grad:
+                from torch.utils.checkpoint import checkpoint
+                chunk_latents = checkpoint(encoder, x, use_reentrant=False)
+            else:
+                chunk_latents = encoder(x) # [MB, d_model]
+                
+            all_latents.append(chunk_latents)
+            
+        latents = torch.cat(all_latents, dim=0) # [BT, d_model]
         return latents.reshape(b, t, self.d_model)
 
     def forward(
@@ -122,16 +145,8 @@ class ARCJEPAWorldModel(nn.Module):
 
         if use_teacher_forcing:
             # TEACHER FORCING: Use ground truth states as input
-            # Encode states in smaller chunks to save memory
-            all_states_encoded = []
-            chunk_size = 4  # Process 4 frames at a time to reduce memory
-
-            for i in range(0, T-1, chunk_size):
-                end_idx = min(i + chunk_size, T-1)
-                chunk_encoded = self.encode(states[:, i:end_idx], self.online_encoder)
-                all_states_encoded.append(chunk_encoded)
-
-            all_states_encoded = torch.cat(all_states_encoded, dim=1)  # [B, T-1, d_model]
+            # Spatial encoder internal micro-batching prevents OOM automatically
+            all_states_encoded = self.encode(states[:, :T-1], self.online_encoder)  # [B, T-1, d_model]
 
             # Prepare action embeddings for prediction window
             action_embeds = []
@@ -186,12 +201,13 @@ class ARCJEPAWorldModel(nn.Module):
 
         with torch.no_grad():
             # Encode target states with target encoder (raw embeddings)
-            s_next_target = self.encode(target_grids[:, K:T], self.target_encoder)  # [B, T-K, d_model]
+            # Slice K-1:T-1 (grids[K...T-1]) to match pred_latents
+            s_next_target = self.encode(target_grids[:, K-1:T-1], self.target_encoder)  # [B, T-K, d_model]
 
             # Multi-step targets
-            if self.multistep_k > 1 and K + self.multistep_k <= T:
+            if self.multistep_k > 1 and K - 1 + self.multistep_k <= T:
                 multistep_target_latents = self.encode(
-                    target_grids[:, K:K+self.multistep_k],
+                    target_grids[:, K - 1 : K - 1 + self.multistep_k],
                     self.target_encoder
                 )
             else:

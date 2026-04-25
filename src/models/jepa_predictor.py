@@ -4,26 +4,22 @@ from typing import Optional
 
 class JEPAPredictor(nn.Module):
     """
-    Memory-efficient JEPA Predictor using GDN (Gated DeltaNet).
+    Memory-efficient JEPA Predictor with bottleneck architecture.
 
-    Predicts next state s_{t+1} from current state s_t and action z_a.
-
-    Key design:
-    - Uses GDN for O(N) complexity (vs O(N²) Transformer)
-    - 6-layer depth for capacity
-    - Bottleneck width (384) as per I-JEPA paper Table 14
+    Key design from I-JEPA paper (Table 14):
+    - Bottleneck width (384) improves performance vs full width (1024)
+    - Lightweight MLP with depth for capacity
     - NO residual connection to force learning
     - Concatenate state+action to preserve information
 
-    Memory: ~100MB (vs ~1GB for Transformer predictor)
-    Complexity: O(N * d²) linear (vs O(N² * d) quadratic)
+    Memory: ~5M params (vs ~30M Transformer, ~40M multi-GDN)
     """
     def __init__(
         self,
         d_model: int,
         num_layers: int = 6,
         num_heads: int = 8,
-        bottleneck_dim: int = 384,  # I-JEPA paper: bottleneck improves performance
+        bottleneck_dim: int = 384,
         dropout: float = 0.1,
         max_seq_len: int = 100
     ):
@@ -34,30 +30,25 @@ class JEPAPredictor(nn.Module):
         # Input projection: concatenate state + action, then bottleneck
         self.input_proj = nn.Sequential(
             nn.Linear(d_model * 2, bottleneck_dim),
-            nn.LayerNorm(bottleneck_dim),
-            nn.GELU()
+            nn.LayerNorm(bottleneck_dim)
         )
 
         # Learnable positional encoding
         self.pos_embed = nn.Parameter(torch.zeros(1, max_seq_len, bottleneck_dim))
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
 
-        # GDN layers for O(N) sequence modeling
-        from .sequence_model import GDNSequenceModel
-        self.gdn_layers = nn.ModuleList([
-            GDNSequenceModel(
-                d_model=bottleneck_dim,
-                n_heads=num_heads,
-                chunk_size=16
-            )
-            for _ in range(num_layers)
-        ])
-
-        # Layer norms between GDN layers
-        self.layer_norms = nn.ModuleList([
-            nn.LayerNorm(bottleneck_dim)
-            for _ in range(num_layers)
-        ])
+        # Deep MLP with bottleneck (paper-faithful)
+        layers = []
+        for i in range(num_layers):
+            layers.extend([
+                nn.Linear(bottleneck_dim, bottleneck_dim * 2),
+                nn.LayerNorm(bottleneck_dim * 2),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(bottleneck_dim * 2, bottleneck_dim),
+                nn.LayerNorm(bottleneck_dim)
+            ])
+        self.mlp_layers = nn.Sequential(*layers)
 
         # Output projection back to d_model (NO RESIDUAL CONNECTION)
         self.output_proj = nn.Sequential(
@@ -92,11 +83,8 @@ class JEPAPredictor(nn.Module):
         pos = self.pos_embed[:, step_idx:step_idx+T, :]
         x = x + pos
 
-        # Process through GDN layers (O(N) complexity)
-        for gdn_layer, layer_norm in zip(self.gdn_layers, self.layer_norms):
-            residual = x
-            x, _ = gdn_layer(x, use_cache=False)
-            x = layer_norm(x + residual)  # Residual within GDN stack only
+        # Deep MLP with bottleneck (paper-faithful)
+        x = self.mlp_layers(x)
 
         # Output projection (NO residual from input - force learning)
         s_next = self.output_proj(x)
