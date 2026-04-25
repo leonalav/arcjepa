@@ -122,8 +122,16 @@ class ARCJEPAWorldModel(nn.Module):
 
         if use_teacher_forcing:
             # TEACHER FORCING: Use ground truth states as input
-            # Encode ALL states (not just context)
-            all_states_encoded = self.encode(states[:, :T-1], self.online_encoder)  # [B, T-1, d_model]
+            # Encode states in smaller chunks to save memory
+            all_states_encoded = []
+            chunk_size = 4  # Process 4 frames at a time to reduce memory
+
+            for i in range(0, T-1, chunk_size):
+                end_idx = min(i + chunk_size, T-1)
+                chunk_encoded = self.encode(states[:, i:end_idx], self.online_encoder)
+                all_states_encoded.append(chunk_encoded)
+
+            all_states_encoded = torch.cat(all_states_encoded, dim=1)  # [B, T-1, d_model]
 
             # Prepare action embeddings for prediction window
             action_embeds = []
