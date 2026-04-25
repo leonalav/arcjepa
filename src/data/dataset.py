@@ -23,7 +23,7 @@ class ARCTrajectoryDataset(Dataset):
         self,
         recording_files: List[str],
         window_size: int = 24,
-        stride: int = 4,
+        stride: int = 12,
         max_grid_size: int = 64,  # Updated to 64 based on ARC-AGI-3 docs
         multistep_k: int = 1,
         compute_temporal_masks: bool = False,
@@ -63,11 +63,31 @@ class ARCTrajectoryDataset(Dataset):
                 self.chunks.append(chunk)
 
     def _preprocess_frame(self, frame_data: Dict[str, Any]) -> Dict[str, Any]:
-        # Extract grid (Official recordings store this in the 'frame' key)
-        grid = np.array(frame_data.get('frame', []), dtype=np.int64)
+        # Extract grid via aggressive recursive search to bypass undocumented JSON schema changes
+        def extract_grid(obj):
+            if isinstance(obj, list) and len(obj) > 0 and isinstance(obj[0], list):
+                return obj
+            if isinstance(obj, dict):
+                # Prioritize known keys
+                for k in ['grid', 'frame', 'board', 'state', 'observation']:
+                    if k in obj:
+                        res = extract_grid(obj[k])
+                        if res is not None: return res
+                # Fallback: search all values
+                for v in obj.values():
+                    res = extract_grid(v)
+                    if res is not None: return res
+            return None
+
+        grid_data = extract_grid(frame_data) or []
+        grid = np.array(grid_data, dtype=np.int64)
         
+        # Ensure exactly 2D to prevent padding logic errors
+        while grid.ndim > 2:
+            grid = grid[0]
+            
         # Handle cases where the frame might be empty/None initially
-        if grid.size == 0:
+        if grid.ndim < 2 or grid.size == 0:
             grid = np.zeros((1, 1), dtype=np.int64)
             
         h, w = grid.shape

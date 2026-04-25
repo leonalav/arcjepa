@@ -126,7 +126,7 @@ def train():
         batch_size=args.batch_size, 
         shuffle=(sampler is None), 
         sampler=sampler,
-        num_workers=0 if world_size > 1 else 4,
+        num_workers=4,
         pin_memory=True
     )
 
