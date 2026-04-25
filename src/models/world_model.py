@@ -71,7 +71,7 @@ class ARCJEPAWorldModel(nn.Module):
             nn.Linear(1024, 1024)
         )
 
-    def encode(self, grids: torch.Tensor, encoder: nn.Module, max_batch_size: int = 2) -> torch.Tensor:
+    def encode(self, grids: torch.Tensor, encoder: nn.Module, max_batch_size: int = 8) -> torch.Tensor:
         """
         grids: [Batch, T, 64, 64]
         encoder: online_encoder or target_encoder

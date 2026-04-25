@@ -240,30 +240,47 @@ def create_mock_trajectory(
     print(f"Generating {num_trajectories} trajectories with heuristic policy...")
     print(f"Filters: min_changes={min_state_changes}, min_fg={min_fg_ratio}")
 
+    def get_grid(obs):
+        grid_data = None
+        if hasattr(obs, 'grid'): grid_data = obs.grid
+        elif hasattr(obs, 'frame'): grid_data = obs.frame
+        elif hasattr(obs, 'board'): grid_data = obs.board
+        
+        if grid_data is not None:
+            arr = np.array(grid_data, dtype=np.int64)
+            # Force exactly 2D to prevent unpacking errors (e.g., h, w = grid.shape)
+            while arr.ndim > 2:
+                arr = arr[0]
+            if arr.ndim < 2:
+                arr = np.zeros((2, 2), dtype=np.int64)
+            return arr
+        return None
+
     while successful < num_trajectories and attempts < max_attempts:
         game_id = game_ids[attempts % len(game_ids)]
 
         try:
             env = arc.make(game_id, save_recording=True)
             obs = env.reset()
+            current_grid = get_grid(obs)
 
-            if obs is None or obs.grid is None:
+            if obs is None or current_grid is None:
                 attempts += 1
                 continue
 
             # Track trajectory quality
             state_changes = 0
-            prev_grid = obs.grid.copy()
+            prev_grid = current_grid.copy()
             max_fg_ratio = 0.0
             step = 0
             max_steps = 50
 
             while step < max_steps:
-                if obs is None or obs.grid is None:
+                if obs is None or current_grid is None:
                     break
 
                 # Select action using heuristic policy
-                action_enum, x, y = policy.select_action(obs.grid, step)
+                action_enum, x, y = policy.select_action(current_grid, step)
 
                 # Execute action
                 if action_enum == GameAction.ACTION6:
@@ -271,16 +288,18 @@ def create_mock_trajectory(
                 else:
                     obs = env.step(action_enum)
 
+                current_grid = get_grid(obs)
+
                 # Track state changes
-                if obs and obs.grid is not None:
-                    if not np.array_equal(obs.grid, prev_grid):
+                if obs and current_grid is not None:
+                    if not np.array_equal(current_grid, prev_grid):
                         state_changes += 1
 
                     # Track foreground ratio
-                    fg_ratio = np.mean(obs.grid != 0)
+                    fg_ratio = np.mean(current_grid != 0)
                     max_fg_ratio = max(max_fg_ratio, fg_ratio)
 
-                    prev_grid = obs.grid.copy()
+                    prev_grid = current_grid.copy()
 
                 # Check termination
                 if obs and obs.state in [GameState.WIN, GameState.GAME_OVER]:
@@ -306,7 +325,9 @@ def create_mock_trajectory(
     if local_recordings.exists():
         moved = 0
         for jsonl_file in local_recordings.glob("**/*.jsonl"):
-            shutil.copy(jsonl_file, Path(output_dir) / jsonl_file.name)
+            # Append the unique counter to prevent overwriting
+            new_name = f"{jsonl_file.stem}_{moved}.jsonl"
+            shutil.copy(jsonl_file, Path(output_dir) / new_name)
             moved += 1
         print(f"\nMoved {moved} recordings to {output_dir}")
 

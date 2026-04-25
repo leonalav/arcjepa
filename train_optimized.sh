@@ -7,7 +7,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # Use gradient checkpointing and mixed precision
 deepspeed train.py \
   --deepspeed \
-  --batch_size 2 \
+  --batch_size 8 \
   --epochs 100 \
   --lr 1e-4 \
   --context_ratio 0.7 \
