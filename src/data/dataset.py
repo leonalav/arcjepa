@@ -23,7 +23,7 @@ class ARCTrajectoryDataset(Dataset):
         self,
         recording_files: List[str],
         window_size: int = 24,
-        stride: int = 12,
+        stride: int = 4,
         max_grid_size: int = 64,  # Updated to 64 based on ARC-AGI-3 docs
         multistep_k: int = 1,
         compute_temporal_masks: bool = False,
@@ -248,8 +248,26 @@ def create_mock_trajectory(
     # Instantiate the official Arcade entry point
     arc = arc_agi.Arcade(environments_dir=str(env_dir))
 
-    # Standard ARC-AGI-3 beginner games
-    game_ids = ["ls20", "ar25", "bp35", "cd82", "cn04", "dc22", "ft09", "wa30"]
+    # Explicitly defined public ARC-AGI-3 games
+    game_ids = [
+        "vc33-5430563c", "sp80-589a99af", "re86-8af5384d", "m0r0-492f87ba", 
+        "wa30-ee6fef47", "r11l-495a7899", "tu93-0768757b", "ka59-38d34dbb", 
+        "sc25-635fd71a", "ft09-0d8bbf25", "ls20-9607627b", "ar25-0c556536", 
+        "lf52-271a04aa", "g50t-5849a774", "su15-1944f8ab", "tn36-ef4dde99", 
+        "sb26-7fbdac44", "cn04-2fe56bfb", "lp85-305b61c3", "s5i5-18d95033", 
+        "sk48-d8078629", "cd82-fb555c5d", "tr87-cd924810", "bp35-0a0ad940", 
+        "dc22-fdcac232"
+    ]
+
+    # 20/5 Train/Validation Split
+    import random
+    random.shuffle(game_ids)
+    val_split_size = min(5, len(game_ids) // 5) # Hold out up to 5 games
+    val_games = set(game_ids[:val_split_size])
+    train_games = set(game_ids[val_split_size:])
+
+    print(f"Dataset Split: {len(train_games)} Train games, {len(val_games)} Validation games")
+    print(f"Held-out Validation Set: {val_games}")
 
     # Initialize heuristic policy
     policy = ARCHeuristicPolicy(exploration_rate=0.2)
@@ -340,16 +358,39 @@ def create_mock_trajectory(
 
         attempts += 1
 
-    # Move recordings to output directory
+    # Move recordings to output directory and split them into Train/Val
     local_recordings = Path("recordings")
     if local_recordings.exists():
-        moved = 0
+        train_dir = Path(output_dir) / "train"
+        val_dir = Path(output_dir) / "val"
+        train_dir.mkdir(parents=True, exist_ok=True)
+        val_dir.mkdir(parents=True, exist_ok=True)
+
+        moved_train = 0
+        moved_val = 0
+
         for jsonl_file in local_recordings.glob("**/*.jsonl"):
+            # Identify which full game ID this file belongs to
+            file_game_id = None
+            for gid in game_ids:
+                if jsonl_file.name.startswith(gid):
+                    file_game_id = gid
+                    break
+            
+            target_dir = val_dir if file_game_id in val_games else train_dir
+            
             # Append the unique counter to prevent overwriting
-            new_name = f"{jsonl_file.stem}_{moved}.jsonl"
-            shutil.copy(jsonl_file, Path(output_dir) / new_name)
-            moved += 1
-        print(f"\nMoved {moved} recordings to {output_dir}")
+            new_name = f"{jsonl_file.stem}_{moved_train + moved_val}.jsonl"
+            shutil.copy(jsonl_file, target_dir / new_name)
+            
+            if file_game_id in val_games:
+                moved_val += 1
+            else:
+                moved_train += 1
+
+        print(f"\nSuccessfully split dataset:")
+        print(f"  Moved {moved_train} recordings to {train_dir}")
+        print(f"  Moved {moved_val} recordings to {val_dir}")
 
     print(f"\nGeneration complete:")
     print(f"  Valid trajectories: {successful}/{num_trajectories}")

@@ -11,7 +11,5 @@ source myenv/bin/activate
 
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu129
 pip install transformers datasets trl accelerate peft huggingface_hub sentencepiece
-pip install adam-atan2-pytorch einops wandb tqdm pydantic omegaconf hydra-core trl bitsandbytes flash-linear-attention
-pip install --no-deps unsloth unsloth-zoo
-pip install arc-agi
+pip install adam-atan2-pytorch einops wandb tqdm pydantic omegaconf hydra-core trl bitsandbytes flash-linear-attention arc-agi deepspeed
 echo "done!"

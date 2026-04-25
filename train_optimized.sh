@@ -8,7 +8,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 deepspeed train.py \
   --deepspeed \
   --batch_size 8 \
-  --epochs 100 \
+  --epochs 10 \
   --lr 1e-4 \
   --context_ratio 0.7 \
   --recon_weight 1.0 \

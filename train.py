@@ -98,10 +98,14 @@ def train():
     if world_size > 1: dist.barrier()
     
     # CRITICAL: ALL processes re-read the directory after potential generation
-    recording_files = list(data_path.glob("*.jsonl"))
+    # Now strictly pointing to the 'train' split to prevent data contamination
+    train_data_path = data_path / "train"
+    recording_files = list(train_data_path.glob("*.jsonl"))
     
     if not recording_files:
-        recording_files = list(PROJECT_ROOT.glob("**/*.jsonl"))
+        print(f"Warning: No recordings found in {train_data_path}. Ensure generation completed.")
+        # Fallback to direct path if the user didn't use the split generator
+        recording_files = list(data_path.glob("*.jsonl"))
         
     if not recording_files:
         if is_main_process: print("Error: No .jsonl files found.")
