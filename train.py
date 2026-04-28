@@ -76,10 +76,27 @@ def train():
 
     args = parser.parse_args()
 
-    # Initialize Distributed environment
-    rank, world_size, local_rank = setup_dist(args.local_rank)
-    is_main_process = (rank == 0)
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    # Detect TPU dynamically
+    try:
+        import torch_xla
+        is_tpu = True
+    except ImportError:
+        is_tpu = False
+
+    if is_tpu:
+        from accelerate import Accelerator
+        accelerator = Accelerator()
+        device = accelerator.device
+        is_main_process = accelerator.is_main_process
+        world_size = accelerator.num_processes
+        local_rank = accelerator.local_process_index
+        rank = accelerator.process_index
+    else:
+        accelerator = None
+        # Initialize Distributed environment
+        rank, world_size, local_rank = setup_dist(args.local_rank)
+        is_main_process = (rank == 0)
+        device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
     # 1. Setup Data
     data_path = Path(args.data_dir)
@@ -87,7 +104,9 @@ def train():
         data_path.mkdir(parents=True, exist_ok=True)
     
     # Wait for directory creation if multi-gpu
-    if world_size > 1: dist.barrier()
+    if is_tpu:
+        accelerator.wait_for_everyone()
+    elif world_size > 1: dist.barrier()
     
     # Check if files exist and generate if necessary (Main process only)
     if is_main_process and not list(data_path.glob("*.jsonl")):
@@ -95,7 +114,9 @@ def train():
         create_mock_trajectory(args.data_dir, num_trajectories=args.num_trajectories)
         
     # ALL processes wait for generation to finish
-    if world_size > 1: dist.barrier()
+    if is_tpu:
+        accelerator.wait_for_everyone()
+    elif world_size > 1: dist.barrier()
     
     # CRITICAL: ALL processes re-read the directory after potential generation
     # Now strictly pointing to the 'train' split to prevent data contamination
@@ -122,7 +143,10 @@ def train():
     if is_main_process:
         dataset.validate_arc_compliance()
 
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
+    if is_tpu:
+        sampler = None
+    else:
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
     
     # Use num_workers=0 for distributed to avoid potential multiproc deadlocks on some systems
     dataloader = DataLoader(
@@ -131,7 +155,8 @@ def train():
         shuffle=(sampler is None), 
         sampler=sampler,
         num_workers=4,
-        pin_memory=True
+        pin_memory=not is_tpu,
+        drop_last=is_tpu
     )
 
     # 2. Initialize Model & Components
@@ -140,10 +165,12 @@ def train():
         num_vit_layers=6,  # Increased from 4
         num_gdn_heads=8,  # Increased from 4
         multistep_k=args.multistep_k
-    ).to(device)
+    )
+    if not is_tpu:
+        model = model.to(device)
     
     # DeepSpeed Integration (Optional)
-    if args.deepspeed:
+    if not is_tpu and args.deepspeed:
         try:
             import deepspeed
             # DeepSpeed expects local_rank in its init
@@ -162,7 +189,7 @@ def train():
             args.deepspeed = False
 
     # Standard DDP if multi-gpu and not using DeepSpeed
-    if world_size > 1 and not args.deepspeed:
+    if not is_tpu and world_size > 1 and not args.deepspeed:
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
     criterion = ARCJPELoss(
@@ -174,15 +201,22 @@ def train():
         focal_gamma=args.focal_gamma,
         temporal_weight_multiplier=args.temporal_weight
     )
-    if not args.deepspeed:
+    if is_tpu or not args.deepspeed:
         optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+        
+    if is_tpu:
+        model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
     
     # EMA Updater
-    ema_updater = EMAUpdater(
-        model.module.online_encoder if hasattr(model, 'module') else model.online_encoder,
-        model.module.target_encoder if hasattr(model, 'module') else model.target_encoder,
-        tau=0.999
-    )
+    if is_tpu:
+        unwrapped = accelerator.unwrap_model(model)
+        online_enc = unwrapped.online_encoder
+        target_enc = unwrapped.target_encoder
+    else:
+        online_enc = model.module.online_encoder if hasattr(model, 'module') else model.online_encoder
+        target_enc = model.module.target_encoder if hasattr(model, 'module') else model.target_encoder
+        
+    ema_updater = EMAUpdater(online_enc, target_enc, tau=0.999)
 
     # Initialize logger
     logger = None
@@ -238,14 +272,23 @@ def train():
                 if args.use_curriculum:
                     print(f"  Context ratio: {context_ratio:.2f}")
 
-            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            if not is_tpu:
+                batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
-            if args.deepspeed:
+            if args.deepspeed and not is_tpu:
                 outputs = model(batch, context_ratio=context_ratio, use_teacher_forcing=True)
                 loss_dict = criterion(outputs, batch)
                 loss = loss_dict['loss']
                 model.backward(loss)
                 model.step()
+            elif is_tpu:
+                optimizer.zero_grad()
+                outputs = model(batch, context_ratio=context_ratio, use_teacher_forcing=True)
+                loss_dict = criterion(outputs, batch)
+                loss = loss_dict['loss']
+                accelerator.backward(loss)
+                accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
             else:
                 optimizer.zero_grad()
                 outputs = model(batch, context_ratio=context_ratio, use_teacher_forcing=True)
@@ -313,8 +356,14 @@ def train():
             # Save Checkpoint
             save_path = Path(args.output_dir)
             save_path.mkdir(exist_ok=True)
-            state_to_save = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
-            torch.save(state_to_save, save_path / f"world_model_epoch_{epoch+1}.pt")
+            if is_tpu:
+                accelerator.wait_for_everyone()
+                unwrapped_model = accelerator.unwrap_model(model)
+                if is_main_process:
+                    torch.save(unwrapped_model.state_dict(), save_path / f"world_model_epoch_{epoch+1}.pt")
+            else:
+                state_to_save = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+                torch.save(state_to_save, save_path / f"world_model_epoch_{epoch+1}.pt")
 
             # Save CSV metrics for this epoch
             if args.logger == "csv" and csv_metrics:
@@ -330,7 +379,7 @@ def train():
         print("Training Complete!")
         if args.logger == "tensorboard" and logger is not None:
             logger.close()
-    if world_size > 1: dist.destroy_process_group()
+    if not is_tpu and world_size > 1: dist.destroy_process_group()
 
 if __name__ == "__main__":
     train()
