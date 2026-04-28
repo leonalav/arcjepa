@@ -23,14 +23,37 @@ class GDNSequenceModel(nn.Module):
         **kwargs
     ):
         super().__init__()
-        if not HAS_FLA or not torch.cuda.is_available():
+        
+        # Check if we're on TPU (no CUDA, but torch_xla available)
+        try:
+            import torch_xla
+            is_tpu = True
+        except ImportError:
+            is_tpu = False
+
+        if is_tpu:
+            print("TPU detected. Replacing Triton-based GDN with native SDPA Transformer layer.")
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=n_heads,
+                dim_feedforward=d_model * 4,
+                dropout=0.1,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True
+            )
+            self.model = encoder_layer
+            self.is_tpu_fallback = True
+        elif not HAS_FLA or not torch.cuda.is_available():
             # Fallback for CPU-only environments or missing fla
             self.model = None
+            self.is_tpu_fallback = False
             if not HAS_FLA:
                 print("Warning: flash-linear-attention (fla) not found. GDNSequenceModel will not function.")
             else:
                 print("Warning: GPU not detected. Disabling fla-based GDN (Triton requires CUDA).")
         else:
+            self.is_tpu_fallback = False
             # GatedDeltaNet in 'fla' uses 'hidden_size' and 'num_heads'
             self.model = GatedDeltaNet(
                 hidden_size=d_model,
@@ -50,6 +73,14 @@ class GDNSequenceModel(nn.Module):
         state: Optional recurrent state for inference
         Returns: [Batch, T, d_model] and next state
         """
+        if getattr(self, 'is_tpu_fallback', False):
+            # For TransformerEncoderLayer, we generate a causal mask
+            seq_len = x.size(1)
+            mask = nn.Transformer.generate_square_subsequent_mask(seq_len, device=x.device)
+            # TransformerEncoderLayer efficiently maps to Native SDPA in PyTorch 2.0+
+            out = self.model(x, src_mask=mask, is_causal=True)
+            return out, None
+
         if self.model is None:
             return x, None
             
