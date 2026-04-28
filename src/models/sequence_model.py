@@ -2,92 +2,78 @@ import torch
 import torch.nn as nn
 from typing import Optional, Tuple
 
+# --- Backend selection -------------------------------------------------------
+# Priority:
+#   1. TPU / CPU → gdntpu (pure PyTorch, XLA-safe, no Triton)
+#   2. CUDA + FLA installed → FLA Triton kernels (fast GPU training)
+#   3. Fallback → gdntpu (always works)
+# -----------------------------------------------------------------------------
+
+# gdntpu is always available (pure PyTorch).
+from src.models.gdntpu import GatedDeltaNet as TPUGatedDeltaNet
+
+# Optionally import FLA for GPU fast-path.
 try:
-    from fla.layers import GatedDeltaNet
+    from fla.layers import GatedDeltaNet as FLAGatedDeltaNet
     HAS_FLA = True
 except ImportError:
     HAS_FLA = False
-    # Fallback to a dummy or raise error if required by user
-    # Given the strict "FLA one" instruction, I'll use it as if it's there.
+
 
 class GDNSequenceModel(nn.Module):
+    """Sequence model using Gated Delta Network.
+
+    On TPU/CPU: uses the pure-PyTorch ``gdntpu.GatedDeltaNet`` (XLA-safe).
+    On CUDA (with fla installed): uses ``fla.layers.GatedDeltaNet`` (Triton).
+
+    State-dict keys are identical between both backends, so checkpoints saved
+    on TPU can be loaded directly into the CUDA variant and vice-versa.
     """
-    M-Model: Sequence model using Gated Delta Network.
-    Maintains temporal state and models the latent transition sequence.
-    """
+
     def __init__(
-        self, 
-        d_model: int, 
+        self,
+        d_model: int,
         n_heads: int = 4,
-        chunk_size: int = 16, # Chunk size for parallel training
-        **kwargs
+        **kwargs,
     ):
         super().__init__()
-        
-        # Check if we're on TPU (no CUDA, but torch_xla available)
-        try:
-            import torch_xla
-            is_tpu = True
-        except ImportError:
-            is_tpu = False
 
-        if is_tpu:
-            print("TPU detected. Replacing Triton-based GDN with native SDPA Transformer layer.")
-            encoder_layer = nn.TransformerEncoderLayer(
-                d_model=d_model,
-                nhead=n_heads,
-                dim_feedforward=d_model * 4,
-                dropout=0.1,
-                activation="gelu",
-                batch_first=True,
-                norm_first=True
-            )
-            self.model = encoder_layer
-            self.is_tpu_fallback = True
-        elif not HAS_FLA or not torch.cuda.is_available():
-            # Fallback for CPU-only environments or missing fla
-            self.model = None
-            self.is_tpu_fallback = False
-            if not HAS_FLA:
-                print("Warning: flash-linear-attention (fla) not found. GDNSequenceModel will not function.")
-            else:
-                print("Warning: GPU not detected. Disabling fla-based GDN (Triton requires CUDA).")
-        else:
-            self.is_tpu_fallback = False
-            # GatedDeltaNet in 'fla' uses 'hidden_size' and 'num_heads'
-            self.model = GatedDeltaNet(
+        is_cuda = torch.cuda.is_available()
+
+        if is_cuda and HAS_FLA:
+            # Fast GPU path via Triton kernels.
+            self.model = FLAGatedDeltaNet(
                 hidden_size=d_model,
                 num_heads=n_heads,
-                chunk_size=chunk_size,
-                **kwargs
+                **kwargs,
             )
-        
+            self._backend = "fla"
+        else:
+            # TPU / CPU path — pure PyTorch, fully XLA-compatible.
+            self.model = TPUGatedDeltaNet(
+                hidden_size=d_model,
+                num_heads=n_heads,
+                **kwargs,
+            )
+            self._backend = "tpu"
+
     def forward(
-        self, 
-        x: torch.Tensor, 
+        self,
+        x: torch.Tensor,
         state: Optional[torch.Tensor] = None,
-        use_cache: bool = False
+        use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        x: [Batch, T, d_model]
-        state: Optional recurrent state for inference
-        Returns: [Batch, T, d_model] and next state
-        """
-        if getattr(self, 'is_tpu_fallback', False):
-            # For TransformerEncoderLayer, we generate a causal mask
-            seq_len = x.size(1)
-            mask = nn.Transformer.generate_square_subsequent_mask(seq_len, device=x.device)
-            # TransformerEncoderLayer efficiently maps to Native SDPA in PyTorch 2.0+
-            out = self.model(x, src_mask=mask, is_causal=True)
-            return out, None
+        Args:
+            x         : ``[B, T, d_model]``
+            state     : Optional recurrent state for inference.
+            use_cache : Whether to return the final recurrent state.
 
-        if self.model is None:
-            return x, None
-            
-        # GatedDeltaNet from fla supports both parallel and recurrent modes
-        # Depending on the version, it might return (output, state) or (output, state, last_state)
-        # We ensure we only return (output, state) to match the WorldModel expectations.
-        res = self.model(x, state=state, use_cache=use_cache)
+        Returns:
+            ``(output [B, T, d_model], next_state or None)``
+        """
+        # Both backends return (output, attn_weights, past_key_values).
+        res = self.model(x, past_key_values=state, use_cache=use_cache)
         if isinstance(res, (tuple, list)):
-            return res[0], res[1]
+            return res[0], res[2]   # output, past_key_values
         return res, None
