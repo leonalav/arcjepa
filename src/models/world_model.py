@@ -98,7 +98,7 @@ class ARCJEPAWorldModel(nn.Module):
             # for EVERY chunk for the backward pass, causing an inevitable OOM.
             if x.requires_grad:
                 from torch.utils.checkpoint import checkpoint
-                chunk_latents = checkpoint(encoder, x, use_reentrant=False)
+                chunk_latents = checkpoint(encoder, x, use_reentrant=False, preserve_rng_state=False)
             else:
                 chunk_latents = encoder(x) # [MB, d_model]
                 

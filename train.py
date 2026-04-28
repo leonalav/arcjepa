@@ -3,11 +3,12 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.multiprocessing
 import torch.distributed as dist
 from pathlib import Path
 import argparse
 import sys
-
+torch.multiprocessing.set_sharing_strategy('file_system')
 # Detect project root dynamically
 PROJECT_ROOT = Path(__file__).parent.resolve()
 
@@ -83,6 +84,11 @@ def train():
     except ImportError:
         is_tpu = False
 
+    # gdntpu (pure-PyTorch) is used on any non-CUDA path (TPU or CPU).
+    # It requires strictly static sequence lengths so XLA can trace and cache
+    # a single compiled graph.  We must never feed a partial final batch.
+    use_gdntpu = is_tpu or not torch.cuda.is_available()
+
     if is_tpu:
         from accelerate import Accelerator
         accelerator = Accelerator()
@@ -132,8 +138,15 @@ def train():
         if is_main_process: print("Error: No .jsonl files found.")
         sys.exit(1)
 
+    # IMPORTANT — XLA static-shape requirement:
+    # window_size must be a multiple of the GDN chunk_size (64) so that the
+    # padded sequence length never changes between batches.  A window of 64
+    # means every batch has shape [B, 64, H, W] — a single static XLA graph.
+    gdn_chunk_size = 64
+    window_size = gdn_chunk_size  # 64 steps per trajectory window
     dataset = ARCTrajectoryDataset(
         [str(f) for f in recording_files],
+        window_size=window_size,
         multistep_k=args.multistep_k,
         compute_temporal_masks=args.compute_temporal_masks,
         filter_noops=args.filter_noops
@@ -150,13 +163,17 @@ def train():
     
     # Use num_workers=0 for distributed to avoid potential multiproc deadlocks on some systems
     dataloader = DataLoader(
-        dataset, 
-        batch_size=args.batch_size, 
-        shuffle=(sampler is None), 
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=(sampler is None),
         sampler=sampler,
-        num_workers=4,
+        num_workers=0,
         pin_memory=not is_tpu,
-        drop_last=is_tpu
+        # drop_last MUST be True on any path that uses gdntpu (TPU or CPU).
+        # XLA traces one compiled graph per unique input shape.  A partial
+        # final batch would create a second distinct graph, doubling compile
+        # time and potentially causing out-of-memory during the second trace.
+        drop_last=use_gdntpu,
     )
 
     # 2. Initialize Model & Components
@@ -249,7 +266,15 @@ def train():
         print(f"Starting training on {world_size} GPU(s) using {'DeepSpeed' if args.deepspeed else 'DDP'}...")
         print(f"Dataset size: {len(dataset)}")
         print(f"Extensions: VICReg={args.use_vicreg}, MultiStep={args.multistep_k}, Focal={args.use_focal}")
-        print("Note: First batch may take 2-3 minutes due to Triton kernel compilation.")
+        if use_gdntpu:
+            print(
+                "Note: First forward+backward pass will take several minutes while "
+                "XLA traces and compiles the GDN graph (pure_chunk_gated_delta_rule "
+                "nested loops + all surrounding ops). Every subsequent batch will be "
+                "lightning fast — the compiled graph is cached for the entire run."
+            )
+        else:
+            print("Note: First batch may take ~30 s for Triton kernel JIT compilation.")
 
     # CSV logging setup
     csv_metrics = []
