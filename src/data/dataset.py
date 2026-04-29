@@ -245,26 +245,69 @@ class FastHFARCDataset(Dataset):
     """
     Lightning-fast dataset that reads memory-mapped Arrow files from Hugging Face.
     Provides the exact pre-sliced dictionary format expected by the GDN World Model.
+    
+    CRITICAL for XLA/TPU: Enforces a fixed sequence length (max_seq_len) so that
+    every batch produces identical tensor shapes. XLA compiles ONE graph per unique
+    shape — variable lengths would cause repeated recompilations and OOM.
     """
-    def __init__(self, hf_repo_id: str, split: str = "train", compute_temporal_masks: bool = False):
+    def __init__(self, hf_repo_id: str, split: str = "train", 
+                 compute_temporal_masks: bool = False,
+                 max_seq_len: int = 64):
         super().__init__()
         self.hf_ds = load_dataset(hf_repo_id, split=split)
         self.compute_temporal_masks = compute_temporal_masks
+        self.max_seq_len = max_seq_len  # Fixed T for XLA static shapes
         
     def __len__(self):
         return len(self.hf_ds)
 
+    def _pad_or_window(self, tensor: torch.Tensor, target_len: int) -> torch.Tensor:
+        """Pad short sequences or randomly window long sequences to target_len."""
+        current_len = tensor.shape[0]
+        if current_len == target_len:
+            return tensor
+        elif current_len > target_len:
+            # Random window for data augmentation + length control
+            max_start = current_len - target_len
+            start = random.randint(0, max_start)
+            return tensor[start:start + target_len]
+        else:
+            # Pad by repeating the last frame/value
+            pad_shape = list(tensor.shape)
+            pad_shape[0] = target_len - current_len
+            padding = tensor[-1:].expand(pad_shape)
+            return torch.cat([tensor, padding], dim=0)
+
     def __getitem__(self, idx):
         item = self.hf_ds[idx]
         
-        # Cast Arrow numpy arrays back directly into long tensors for embedding lookups
+        # Cast Arrow numpy arrays back directly into long tensors
+        states_raw = torch.tensor(item['states'], dtype=torch.long)
+        actions_raw = torch.tensor(item['actions'], dtype=torch.long)
+        coords_x_raw = torch.tensor(item['coords_x'], dtype=torch.long)
+        coords_y_raw = torch.tensor(item['coords_y'], dtype=torch.long)
+        target_states_raw = torch.tensor(item['target_states'], dtype=torch.long)
+        
+        # states and target_states have T steps; actions/coords have T steps
+        # We need T = max_seq_len for all of them
+        T = self.max_seq_len
+        
+        states = self._pad_or_window(states_raw, T)
+        actions = self._pad_or_window(actions_raw, T)
+        coords_x = self._pad_or_window(coords_x_raw, T)
+        coords_y = self._pad_or_window(coords_y_raw, T)
+        target_states = self._pad_or_window(target_states_raw, T)
+        
+        # final_state is the last target state
+        final_state = target_states[-1]  # [64, 64]
+        
         result = {
-            'states': torch.tensor(item['states'], dtype=torch.long),
-            'actions': torch.tensor(item['actions'], dtype=torch.long),
-            'coords_x': torch.tensor(item['coords_x'], dtype=torch.long),
-            'coords_y': torch.tensor(item['coords_y'], dtype=torch.long),
-            'target_states': torch.tensor(item['target_states'], dtype=torch.long),
-            'final_state': torch.tensor(item['final_state'], dtype=torch.long)
+            'states': states,
+            'actions': actions,
+            'coords_x': coords_x,
+            'coords_y': coords_y,
+            'target_states': target_states,
+            'final_state': final_state,
         }
         
         if self.compute_temporal_masks:

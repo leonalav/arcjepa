@@ -433,7 +433,17 @@ def train():
                         if args.multistep_k > 1:
                             print(f"  MultiStep: loss={loss_dict_cpu['multistep_jepa_loss']:.4f}")
 
+        # ── Epoch End ────────────────────────────────────────────────────────────
+        # CRITICAL: wait_for_everyone() is a collective barrier — ALL 8 processes
+        # must call it simultaneously. It MUST be outside is_main_process blocks
+        # or the 7 non-main processes never reach it and main hangs indefinitely.
+        if IS_TPU:
+            import torch_xla.core.xla_model as xm
+            xm.mark_step()                  # flush XLA graph before barrier
+            accelerator.wait_for_everyone() # all 8 cores sync here
+
         if is_main_process:
+            # Materialize avg_loss after the barrier (avoids premature device sync)
             avg_loss = (total_loss / len(dataloader)).item() if isinstance(total_loss, torch.Tensor) else total_loss / len(dataloader)
             print(f"Epoch [{epoch+1}/{args.epochs}] Average Loss: {avg_loss:.4f}")
 
@@ -441,10 +451,8 @@ def train():
             save_path = Path(args.output_dir)
             save_path.mkdir(exist_ok=True)
             if IS_TPU:
-                accelerator.wait_for_everyone()
                 unwrapped_model = accelerator.unwrap_model(model)
-                if is_main_process:
-                    torch.save(unwrapped_model.state_dict(), save_path / f"world_model_epoch_{epoch+1}.pt")
+                torch.save(unwrapped_model.state_dict(), save_path / f"world_model_epoch_{epoch+1}.pt")
             else:
                 state_to_save = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
                 torch.save(state_to_save, save_path / f"world_model_epoch_{epoch+1}.pt")

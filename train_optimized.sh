@@ -23,8 +23,8 @@ deepspeed train.py \
 
 
 # For TPUs
-export TF_CPP_MIN_LOG_LEVEL=0
-export PT_XLA_DEBUG=1
+export TF_CPP_MIN_LOG_LEVEL=3        # 0=DEBUG 1=INFO 2=WARNING 3=ERROR (suppress XLA C++ noise)
+export PT_XLA_DEBUG=0                 # 0 disables Compilation/Execution Analysis + pt-xla-profiler warnings
 export XLA_PERSISTENT_CACHE_DIR=/tmp/xla_cache
 mkdir -p /tmp/xla_cache
 unset TPU_PROCESS_ADDRESSES
@@ -42,4 +42,5 @@ accelerate launch --num_processes 8 --mixed_precision bf16 train.py \
   --multistep_k 3 \
   --use_focal \
   --compute_temporal_masks \
+  --filter_noops \
   --logger csv

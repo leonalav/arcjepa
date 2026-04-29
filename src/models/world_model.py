@@ -95,32 +95,33 @@ class ARCJEPAWorldModel(nn.Module):
             nn.Linear(1024, 1024)
         )
 
-    def encode(self, grids: torch.Tensor, encoder: nn.Module, max_batch_size: int = 16) -> torch.Tensor:
+    def encode(self, grids: torch.Tensor, encoder: nn.Module) -> torch.Tensor:
         """
         grids: [Batch, T, 64, 64]
         encoder: online_encoder or target_encoder
-        max_batch_size: UNUSED (kept for API compat) — all frames processed in one pass
-                        to avoid Python-loop graph breaks on XLA.
         Returns: [Batch, T, d_model] latent states
+
+        With 4×4 patches, each frame has 256 patch tokens + CLS = 257 tokens.
+        Attention per frame = 257² × 2 bytes (bf16) × 8 heads ≈ 1 MB.
+        Even at B×T = 4×64 = 256 frames: 256 MB total attention — trivially fits
+        in 16 GB HBM.  No micro-batching loop required, and XLA compiles a single
+        clean graph with no unrolled iterations.
         """
         b, t, h, w = grids.shape
-        # Flatten time for spatial encoding — single batch for XLA graph consistency
+        # Flatten time: [B*T, H, W]
         grids_flat = grids.reshape(b * t, h, w)
-        
-        # Embed and add positional encoding
-        x = self.grid_embed(grids_flat)   # [B*T, H, W, d_model]
-        p = self.pos_embed(h, w)          # [H, W, d_model]
-        x = x + p.unsqueeze(0)
-        
-        # Spatial encoding — use gradient checkpointing for memory, NOT micro-batching
-        # use_reentrant=False is REQUIRED for XLA: it avoids the non-deterministic
-        # backward graph that use_reentrant=True creates (incompatible with XLA tracing)
-        if x.requires_grad:
-            from torch.utils.checkpoint import checkpoint
-            latents = checkpoint(encoder, x, use_reentrant=False)
-        else:
-            latents = encoder(x)  # [B*T, d_model]
-            
+
+        # Patch embedding: [B*T, Ph, Pw, d_model]  (Ph=Pw=16 for 4×4 patches)
+        x = self.grid_embed(grids_flat)
+
+        # 2D positional encoding at patch-grid resolution: [Ph, Pw, d_model]
+        Ph, Pw = x.shape[1], x.shape[2]
+        pos = self.pos_embed(Ph, Pw)
+        x = x + pos.unsqueeze(0)  # broadcast over batch
+
+        # Single-pass through ViT: [B*T, d_model]
+        latents = encoder(x)
+
         return latents.reshape(b, t, self.d_model)
 
     def forward(
@@ -170,28 +171,29 @@ class ARCJEPAWorldModel(nn.Module):
 
         if use_teacher_forcing:
             # TEACHER FORCING: Use ground truth states as input
-            # Spatial encoder internal micro-batching prevents OOM automatically
             all_states_encoded = self.encode(states[:, :T-1], self.online_encoder)  # [B, T-1, d_model]
 
-            # Prepare action embeddings for prediction window
-            action_embeds = []
-            for t in range(K-1, T-1):
-                z_a = self.action_embed(actions[:, t], cx[:, t], cy[:, t])
-                action_embeds.append(z_a)
-            action_embeds = torch.stack(action_embeds, dim=1)  # [B, T-K, d_model]
+            # Vectorized action embeddings: embed the full prediction window in one op.
+            # Slicing before embedding avoids a Python for-loop that would add T separate
+            # nodes to the XLA graph.
+            action_embeds = self.action_embed(
+                actions[:, K-1:T-1],   # [B, T-K]
+                cx[:, K-1:T-1],
+                cy[:, K-1:T-1]
+            )  # [B, T-K, d_model]
 
-            # Batch prediction (efficient)
-            s_input = all_states_encoded[:, K-1:T-1]  # [B, T-K, d_model]
+            # Batch prediction
+            s_input = all_states_encoded[:, K-1:T-1]         # [B, T-K, d_model]
             pred_latents = self.predictor(s_input, action_embeds, step_idx=K-1)  # [B, T-K, d_model]
 
-            # Multi-step prediction (auxiliary)
+            # Multi-step prediction (auxiliary loss)
             if self.multistep_k > 1 and K-1 + self.multistep_k <= T:
-                s_init = all_states_encoded[:, K-1]  # [B, d_model]
-                action_embeds_k = []
-                for i in range(self.multistep_k):
-                    z_a = self.action_embed(actions[:, K-1+i], cx[:, K-1+i], cy[:, K-1+i])
-                    action_embeds_k.append(z_a)
-                action_embeds_k = torch.stack(action_embeds_k, dim=1)
+                s_init = all_states_encoded[:, K-1]           # [B, d_model]
+                action_embeds_k = self.action_embed(
+                    actions[:, K-1 : K-1+self.multistep_k],
+                    cx[:, K-1 : K-1+self.multistep_k],
+                    cy[:, K-1 : K-1+self.multistep_k]
+                )  # [B, multistep_k, d_model]
 
                 multistep_pred_latents = self.predictor.forward_multistep(
                     s_init, action_embeds_k, self.multistep_k
@@ -227,12 +229,12 @@ class ARCJEPAWorldModel(nn.Module):
         with torch.no_grad():
             # Encode target states with target encoder (raw embeddings)
             # Slice K-1:T-1 (grids[K...T-1]) to match pred_latents
-            s_next_target = self.encode(target_grids[:, K-1:T-1], self.target_encoder)  # [B, T-K, d_model]
+            s_next_target = self.encode(target_grids[:, K-1:T-1], self.target_encoder)
 
             # Multi-step targets
             if self.multistep_k > 1 and K - 1 + self.multistep_k <= T:
                 multistep_target_latents = self.encode(
-                    target_grids[:, K - 1 : K - 1 + self.multistep_k],
+                    target_grids[:, K-1 : K-1+self.multistep_k],
                     self.target_encoder
                 )
             else:

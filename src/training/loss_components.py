@@ -41,7 +41,7 @@ class VICRegCovarianceLoss(nn.Module):
 
         # Penalize off-diagonal elements (divide by D to match VICReg paper)
         # off_diag_loss = (sum(cov^2) - sum(diag(cov)^2)) / D
-        off_diag_loss = ((cov_matrix ** 2).sum() - (torch.diag(cov_matrix) ** 2).sum()) / D
+        off_diag_loss = ((cov_matrix ** 2).sum() - (torch.diagonal(cov_matrix) ** 2).sum()) / D
 
         return off_diag_loss
 
