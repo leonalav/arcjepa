@@ -1,3 +1,5 @@
+import concurrent.futures
+import multiprocessing
 import json
 import torch
 import numpy as np
@@ -12,6 +14,93 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent.resolve()
 import arc_agi
 from torch.utils.data import Dataset
 from arcengine import GameAction, GameState
+
+# =====================================================================
+# MODULE-LEVEL PARSING FUNCTIONS
+# Extracted from the class to allow fast pickling across 96 CPUs.
+# =====================================================================
+
+def _extract_grid_static(obj):
+    if isinstance(obj, list) and len(obj) > 0 and isinstance(obj[0], list):
+        return obj
+    if isinstance(obj, dict):
+        for k in ['grid', 'frame', 'board', 'state', 'observation']:
+            if k in obj:
+                res = _extract_grid_static(obj[k])
+                if res is not None: return res
+        for v in obj.values():
+            res = _extract_grid_static(v)
+            if res is not None: return res
+    return None
+
+def _preprocess_frame_static(frame_data: Dict[str, Any], max_grid_size: int) -> Dict[str, Any]:
+    grid_data = _extract_grid_static(frame_data) or []
+    grid = np.array(grid_data, dtype=np.int64)
+    
+    while grid.ndim > 2: grid = grid[0]
+    if grid.ndim < 2 or grid.size == 0: grid = np.zeros((1, 1), dtype=np.int64)
+        
+    h, w = grid.shape
+    safe_h, safe_w = min(h, max_grid_size), min(w, max_grid_size)
+    
+    padded_grid = np.zeros((max_grid_size, max_grid_size), dtype=np.int64)
+    padded_grid[:safe_h, :safe_w] = grid[:safe_h, :safe_w]
+    
+    action_data = frame_data.get('action_input') or {}
+    if isinstance(action_data, str):
+        action_type = action_data
+        ax, ay = 0, 0
+    else:
+        action_type = action_data.get('action', 'NONE')
+        ax = max(0, min(int(action_data.get('x', 0)), max_grid_size - 1))
+        ay = max(0, min(int(action_data.get('y', 0)), max_grid_size - 1))
+        
+    action_idx = 0
+    if action_type.startswith('ACTION') and action_type[6:].isdigit():
+        action_idx = int(action_type[6:])
+    elif action_type == 'SUBMIT':
+        action_idx = 8
+        
+    return {
+        'grid': torch.from_numpy(padded_grid),
+        'action_type': action_idx,
+        'x': ax,
+        'y': ay
+    }
+
+def _process_single_file(args):
+    """Worker function executed independently on the 96 CPUs"""
+    file_path, window_size, stride, max_grid_size, filter_noops = args
+    grids, actions, xs, ys = [], [], [], []
+    
+    with open(file_path, 'r') as f:
+        for line in f:
+            if not line.strip(): continue
+            frame_data = json.loads(line)
+            processed = _preprocess_frame_static(frame_data, max_grid_size)
+            grids.append(processed['grid'].to(torch.uint8))
+            actions.append(processed['action_type'])
+            xs.append(processed['x'])
+            ys.append(processed['y'])
+            
+    traj_len = len(grids)
+    if traj_len < 2:
+        return None
+
+    grids_tensor = torch.stack(grids)
+    actions_tensor = torch.tensor(actions, dtype=torch.uint8)
+    xs_tensor = torch.tensor(xs, dtype=torch.uint8)
+    ys_tensor = torch.tensor(ys, dtype=torch.uint8)
+    
+    valid_starts = []
+    for i in range(0, traj_len - window_size, stride):
+        if filter_noops:
+            chunk_grids = grids_tensor[i : i + window_size + 1]
+            if torch.all(chunk_grids == chunk_grids[0]):
+                continue
+        valid_starts.append(i)
+        
+    return grids_tensor, actions_tensor, xs_tensor, ys_tensor, valid_starts
 
 class ARCTrajectoryDataset(Dataset):
     """
@@ -44,113 +133,35 @@ class ARCTrajectoryDataset(Dataset):
         self._load_recordings(recording_files)
 
     def _load_recordings(self, recording_files: List[str]):
-        for file_path in recording_files:
-            grids = []
-            actions = []
-            xs = []
-            ys = []
-            with open(file_path, 'r') as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    frame_data = json.loads(line)
-                    processed = self._preprocess_frame(frame_data)
-                    grids.append(processed['grid'].to(torch.uint8))
-                    actions.append(processed['action_type'])
-                    xs.append(processed['x'])
-                    ys.append(processed['y'])
-
-            traj_len = len(grids)
-            if traj_len < 2: # Need at least (s_t, a_t, s_{t+1})
+        # XLA spawns 8 processes. We cap max_workers at 12 per process.
+        # 12 workers * 8 XLA processes = 96 CPUs perfectly saturated.
+        max_workers = min(12, multiprocessing.cpu_count())
+        
+        args_list = [
+            (f, self.window_size, self.stride, self.max_grid_size, self.filter_noops) 
+            for f in recording_files
+        ]
+        
+        # CRITICAL: Must use 'spawn' to prevent libtpu from crashing during forks
+        ctx = multiprocessing.get_context('spawn')
+        
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as executor:
+            # map guarantees order is preserved if needed, though chunks are shuffled later
+            results = list(executor.map(_process_single_file, args_list))
+            
+        for res in results:
+            if res is None:
                 continue
-
-            grids_tensor = torch.stack(grids)
-            actions_tensor = torch.tensor(actions, dtype=torch.uint8)
-            xs_tensor = torch.tensor(xs, dtype=torch.uint8)
-            ys_tensor = torch.tensor(ys, dtype=torch.uint8)
+            grids_t, actions_t, xs_t, ys_t, valid_starts = res
             
             traj_idx = len(self.trajectories_grids)
-
-            # Chunk the trajectory into sliding windows
-            for i in range(0, traj_len - self.window_size, self.stride):
-                # Filter no-op chunks (not trajectories) if requested
-                if self.filter_noops:
-                    chunk_grids = grids_tensor[i : i + self.window_size + 1]
-                    if torch.all(chunk_grids == chunk_grids[0]):
-                        continue
-
-                self.chunks.append((traj_idx, i))
-
-            self.trajectories_grids.append(grids_tensor)
-            self.trajectories_actions.append(actions_tensor)
-            self.trajectories_xs.append(xs_tensor)
-            self.trajectories_ys.append(ys_tensor)
-
-    def _preprocess_frame(self, frame_data: Dict[str, Any]) -> Dict[str, Any]:
-        # Extract grid via aggressive recursive search to bypass undocumented JSON schema changes
-        def extract_grid(obj):
-            if isinstance(obj, list) and len(obj) > 0 and isinstance(obj[0], list):
-                return obj
-            if isinstance(obj, dict):
-                # Prioritize known keys
-                for k in ['grid', 'frame', 'board', 'state', 'observation']:
-                    if k in obj:
-                        res = extract_grid(obj[k])
-                        if res is not None: return res
-                # Fallback: search all values
-                for v in obj.values():
-                    res = extract_grid(v)
-                    if res is not None: return res
-            return None
-
-        grid_data = extract_grid(frame_data) or []
-        grid = np.array(grid_data, dtype=np.int64)
-        
-        # Ensure exactly 2D to prevent padding logic errors
-        while grid.ndim > 2:
-            grid = grid[0]
-            
-        # Handle cases where the frame might be empty/None initially
-        if grid.ndim < 2 or grid.size == 0:
-            grid = np.zeros((1, 1), dtype=np.int64)
-            
-        h, w = grid.shape
-        
-        # Safety crop just in case the environment violates the 64x64 max
-        safe_h, safe_w = min(h, self.max_grid_size), min(w, self.max_grid_size)
-        
-        # Pad grid to max_grid_size
-        padded_grid = np.zeros((self.max_grid_size, self.max_grid_size), dtype=np.int64)
-        padded_grid[:safe_h, :safe_w] = grid[:safe_h, :safe_w]
-        
-        # Action parsing (Compliant with Official arcengine format)
-        # Use 'or {}' to handle cases where 'action_input' might be explicitly set to null
-        action_data = frame_data.get('action_input') or {}
-        
-        if isinstance(action_data, str):
-            action_type = action_data
-            ax, ay = 0, 0
-        else:
-            action_type = action_data.get('action', 'NONE')
-            # Clamp coordinates to [0, max_grid_size-1] to prevent IndexError in cross-entropy loss
-            ax = max(0, min(int(action_data.get('x', 0)), self.max_grid_size - 1))
-            ay = max(0, min(int(action_data.get('y', 0)), self.max_grid_size - 1))
-            
-        # Map action type to index (ACTION1-7 -> 1-7, SUBMIT -> 8, others 0)
-        action_idx = 0
-        if action_type.startswith('ACTION') and action_type[6:].isdigit():
-            action_idx = int(action_type[6:])
-        elif action_type == 'SUBMIT':
-            action_idx = 8
-        
-        return {
-            'grid': torch.from_numpy(padded_grid),
-            'action_type': action_idx,
-            'x': ax,
-            'y': ay,
-            'grid_h': safe_h,
-            'grid_w': safe_w
-        }
+            for start_idx in valid_starts:
+                self.chunks.append((traj_idx, start_idx))
+                
+            self.trajectories_grids.append(grids_t)
+            self.trajectories_actions.append(actions_t)
+            self.trajectories_xs.append(xs_t)
+            self.trajectories_ys.append(ys_t)
 
     def __len__(self):
         return len(self.chunks)
@@ -324,7 +335,7 @@ def create_mock_trajectory(
             prev_grid = current_grid.copy()
             max_fg_ratio = 0.0
             step = 0
-            max_steps = 50
+            max_steps = 100
 
             while step < max_steps:
                 if obs is None or current_grid is None:
