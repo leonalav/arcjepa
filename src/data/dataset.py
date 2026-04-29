@@ -6,6 +6,7 @@ import numpy as np
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import random
+from datasets import load_dataset
 
 # Discover project root (3 levels up from src/data/dataset.py)
 PROJECT_ROOT = Path(__file__).parent.parent.parent.resolve()
@@ -239,6 +240,37 @@ class ARCTrajectoryDataset(Dataset):
                         f"Chunk {chunk_idx}, Step {step_idx}: Invalid coords ({xs[step_idx]}, {ys[step_idx]})"
 
         print(f"✓ Dataset validation passed: {len(self.chunks)} chunks comply with ARC-AGI-3 specs")
+
+class FastHFARCDataset(Dataset):
+    """
+    Lightning-fast dataset that reads memory-mapped Arrow files from Hugging Face.
+    Provides the exact pre-sliced dictionary format expected by the GDN World Model.
+    """
+    def __init__(self, hf_repo_id: str, split: str = "train", compute_temporal_masks: bool = False):
+        super().__init__()
+        self.hf_ds = load_dataset(hf_repo_id, split=split)
+        self.compute_temporal_masks = compute_temporal_masks
+        
+    def __len__(self):
+        return len(self.hf_ds)
+
+    def __getitem__(self, idx):
+        item = self.hf_ds[idx]
+        
+        # Cast Arrow numpy arrays back directly into long tensors for embedding lookups
+        result = {
+            'states': torch.tensor(item['states'], dtype=torch.long),
+            'actions': torch.tensor(item['actions'], dtype=torch.long),
+            'coords_x': torch.tensor(item['coords_x'], dtype=torch.long),
+            'coords_y': torch.tensor(item['coords_y'], dtype=torch.long),
+            'target_states': torch.tensor(item['target_states'], dtype=torch.long),
+            'final_state': torch.tensor(item['final_state'], dtype=torch.long)
+        }
+        
+        if self.compute_temporal_masks:
+            result['temporal_mask'] = (result['states'] != result['target_states']).float()
+            
+        return result
 
 def create_mock_trajectory(
     output_dir: str,

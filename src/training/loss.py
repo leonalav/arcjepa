@@ -66,10 +66,10 @@ class ARCJPELoss(nn.Module):
                 temporal_mask = None
 
             recon_loss = self.focal_loss_fn(decoder_logits, final_state_gt, temporal_mask)
-            focal_loss = recon_loss.item()
+            focal_loss = recon_loss.detach()
         else:
             recon_loss = F.cross_entropy(decoder_logits, final_state_gt)
-            focal_loss = 0.0
+            focal_loss = torch.tensor(0.0, device=target_latents.device)
 
         # 3. Variance Regularization (VICReg-style to prevent collapse)
         # Apply to PROJECTED latents to allow core latents to remain flexible
@@ -137,11 +137,11 @@ class ARCJPELoss(nn.Module):
 
         return {
             'loss': total_loss,
-            'jepa_loss': jepa_loss.item(),
-            'recon_loss': recon_loss.item(),
-            'std_loss': std_loss.item(),
-            'cov_loss': cov_loss.item(),
-            'focal_loss': focal_loss,
-            'multistep_jepa_loss': multistep_jepa_loss.item(),
-            'policy_loss': policy_loss.item()
+            'jepa_loss': jepa_loss.detach(),
+            'recon_loss': recon_loss.detach(),
+            'std_loss': std_loss.detach(),
+            'cov_loss': cov_loss.detach(),
+            'focal_loss': focal_loss.detach(),
+            'multistep_jepa_loss': multistep_jepa_loss.detach(),
+            'policy_loss': policy_loss.detach()
         }

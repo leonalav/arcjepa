@@ -99,41 +99,28 @@ class ARCJEPAWorldModel(nn.Module):
         """
         grids: [Batch, T, 64, 64]
         encoder: online_encoder or target_encoder
-        max_batch_size: number of individual frames to process at once through the ViT to prevent OOM.
+        max_batch_size: UNUSED (kept for API compat) — all frames processed in one pass
+                        to avoid Python-loop graph breaks on XLA.
         Returns: [Batch, T, d_model] latent states
         """
         b, t, h, w = grids.shape
-        # Flatten time for spatial encoding
-        grids = grids.reshape(b * t, h, w)
+        # Flatten time for spatial encoding — single batch for XLA graph consistency
+        grids_flat = grids.reshape(b * t, h, w)
         
-        # Tailor max_batch_size for XLA to fit within 16GB TPU HBM limits 
-        # (Attention over 4096 tokens at MB=16 takes >16GB alone)
-        if grids.device.type == 'xla' and max_batch_size == 16:
-            max_batch_size = 8
+        # Embed and add positional encoding
+        x = self.grid_embed(grids_flat)   # [B*T, H, W, d_model]
+        p = self.pos_embed(h, w)          # [H, W, d_model]
+        x = x + p.unsqueeze(0)
+        
+        # Spatial encoding — use gradient checkpointing for memory, NOT micro-batching
+        # use_reentrant=False is REQUIRED for XLA: it avoids the non-deterministic
+        # backward graph that use_reentrant=True creates (incompatible with XLA tracing)
+        if x.requires_grad:
+            from torch.utils.checkpoint import checkpoint
+            latents = checkpoint(encoder, x, use_reentrant=False)
+        else:
+            latents = encoder(x)  # [B*T, d_model]
             
-        all_latents = []
-        # Process in chunks to prevent O(N^2) self-attention from OOMing the GPU
-        for i in range(0, b * t, max_batch_size):
-            chunk = grids[i : i + max_batch_size]
-            
-            # Embed and add pos
-            x = self.grid_embed(chunk) # [MB, H, W, d_model]
-            p = self.pos_embed(h, w)   # [H, W, d_model]
-            x = x + p.unsqueeze(0)
-            
-            # Spatial encoding (Memory bottleneck)
-            # CRITICAL: We MUST use gradient checkpointing here. 
-            # Otherwise, PyTorch stores the massive O(N^2) attention activations 
-            # for EVERY chunk for the backward pass, causing an inevitable OOM.
-            if x.requires_grad:
-                from torch.utils.checkpoint import checkpoint
-                chunk_latents = checkpoint(encoder, x, use_reentrant=True, preserve_rng_state=False)
-            else:
-                chunk_latents = encoder(x) # [MB, d_model]
-                
-            all_latents.append(chunk_latents)
-            
-        latents = torch.cat(all_latents, dim=0) # [BT, d_model]
         return latents.reshape(b, t, self.d_model)
 
     def forward(

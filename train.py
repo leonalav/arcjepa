@@ -31,7 +31,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.models.world_model import ARCJEPAWorldModel
 from src.training.loss import ARCJPELoss
 from src.training.ema import EMAUpdater
-from src.data.dataset import ARCTrajectoryDataset, create_mock_trajectory
+from src.data.dataset import ARCTrajectoryDataset, create_mock_trajectory, FastHFARCDataset
 from src.training.metrics import (
     compute_latent_metrics,
     compute_prediction_metrics,
@@ -79,6 +79,7 @@ def train():
     parser.add_argument("--use_curriculum", action="store_true", help="Use curriculum learning for context ratio")
     parser.add_argument("--curriculum_start", type=float, default=0.9, help="Starting context ratio for curriculum")
     parser.add_argument("--curriculum_end", type=float, default=0.5, help="Ending context ratio for curriculum")
+    parser.add_argument("--hf_repo_id", type=str, default=None, help="HuggingFace repo ID for FastHFARCDataset")
     parser.add_argument("--data_dir", type=str, default=str(PROJECT_ROOT / "data" / "recordings"))
     parser.add_argument("--output_dir", type=str, default=str(PROJECT_ROOT / "checkpoints"))
     parser.add_argument("--recon_weight", type=float, default=0.01)
@@ -126,59 +127,68 @@ def train():
         device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
     # 1. Setup Data
-    data_path = Path(args.data_dir)
-    if is_main_process:
-        data_path.mkdir(parents=True, exist_ok=True)
-    
-    # Wait for directory creation if multi-gpu
-    if IS_TPU:
-        accelerator.wait_for_everyone()
-    elif world_size > 1: dist.barrier()
-    
-    # Check if files exist and generate if necessary (Main process only)
-    if is_main_process:
-        if not check_training_files_exist(data_path):
-            print(f"No recordings found in {args.data_dir} (or its subdirectories). Generating real trajectories via ARC-AGI...")
-            create_mock_trajectory(args.data_dir, num_trajectories=args.num_trajectories)
-        else:
-            print(f"Training files found in {args.data_dir}. Skipping data generation.")
+    if args.hf_repo_id is not None:
+        if is_main_process:
+            print(f"🚀 Using FastHFARCDataset to stream from HuggingFace repo: {args.hf_repo_id}")
+        dataset = FastHFARCDataset(
+            hf_repo_id=args.hf_repo_id, 
+            split="train", 
+            compute_temporal_masks=args.compute_temporal_masks
+        )
+    else:
+        data_path = Path(args.data_dir)
+        if is_main_process:
+            data_path.mkdir(parents=True, exist_ok=True)
         
-    # ALL processes wait for generation to finish
-    if IS_TPU:
-        accelerator.wait_for_everyone()
-    elif world_size > 1: dist.barrier()
-    
-    # CRITICAL: ALL processes re-read the directory after potential generation
-    # Now strictly pointing to the 'train' split to prevent data contamination
-    train_data_path = data_path / "train"
-    recording_files = list(train_data_path.glob("*.jsonl"))
-    
-    if not recording_files:
-        print(f"Warning: No recordings found in {train_data_path}. Ensure generation completed.")
-        # Fallback to direct path if the user didn't use the split generator
-        recording_files = list(data_path.glob("*.jsonl"))
+        # Wait for directory creation if multi-gpu
+        if IS_TPU:
+            accelerator.wait_for_everyone()
+        elif world_size > 1: dist.barrier()
         
-    if not recording_files:
-        if is_main_process: print("Error: No .jsonl files found.")
-        sys.exit(1)
+        # Check if files exist and generate if necessary (Main process only)
+        if is_main_process:
+            if not check_training_files_exist(data_path):
+                print(f"No recordings found in {args.data_dir} (or its subdirectories). Generating real trajectories via ARC-AGI...")
+                create_mock_trajectory(args.data_dir, num_trajectories=args.num_trajectories)
+            else:
+                print(f"Training files found in {args.data_dir}. Skipping data generation.")
+            
+        # ALL processes wait for generation to finish
+        if IS_TPU:
+            accelerator.wait_for_everyone()
+        elif world_size > 1: dist.barrier()
+        
+        # CRITICAL: ALL processes re-read the directory after potential generation
+        # Now strictly pointing to the 'train' split to prevent data contamination
+        train_data_path = data_path / "train"
+        recording_files = list(train_data_path.glob("*.jsonl"))
+        
+        if not recording_files:
+            print(f"Warning: No recordings found in {train_data_path}. Ensure generation completed.")
+            # Fallback to direct path if the user didn't use the split generator
+            recording_files = list(data_path.glob("*.jsonl"))
+            
+        if not recording_files:
+            if is_main_process: print("Error: No .jsonl files found.")
+            sys.exit(1)
 
-    # IMPORTANT — XLA static-shape requirement:
-    # window_size must be a multiple of the GDN chunk_size (64) so that the
-    # padded sequence length never changes between batches.  A window of 64
-    # means every batch has shape [B, 64, H, W] — a single static XLA graph.
-    gdn_chunk_size = 64
-    window_size = gdn_chunk_size  # 64 steps per trajectory window
-    dataset = ARCTrajectoryDataset(
-        [str(f) for f in recording_files],
-        window_size=window_size,
-        multistep_k=args.multistep_k,
-        compute_temporal_masks=args.compute_temporal_masks,
-        filter_noops=args.filter_noops
-    )
+        # IMPORTANT — XLA static-shape requirement:
+        # window_size must be a multiple of the GDN chunk_size (64) so that the
+        # padded sequence length never changes between batches.  A window of 64
+        # means every batch has shape [B, 64, H, W] — a single static XLA graph.
+        gdn_chunk_size = 64
+        window_size = gdn_chunk_size  # 64 steps per trajectory window
+        dataset = ARCTrajectoryDataset(
+            [str(f) for f in recording_files],
+            window_size=window_size,
+            multistep_k=args.multistep_k,
+            compute_temporal_masks=args.compute_temporal_masks,
+            filter_noops=args.filter_noops
+        )
 
-    # Validate ARC compliance
-    if is_main_process:
-        dataset.validate_arc_compliance()
+        # Validate ARC compliance
+        if is_main_process:
+            dataset.validate_arc_compliance()
 
     if IS_TPU:
         sampler = None
@@ -347,26 +357,51 @@ def train():
                 optimizer.step()
 
             ema_updater.update()
-            total_loss += loss.item()
+            total_loss += loss.detach()
 
-            # Compute comprehensive metrics
+            # Compute comprehensive metrics (every 10 batches)
+            # CRITICAL: Move all metric computation to CPU after a single sync
+            # to prevent graph breaks from .item(), eigvalsh, histc, etc.
             if batch_idx % 10 == 0:
+                # Single sync point — flush the XLA graph
+                if IS_TPU:
+                    import torch_xla.core.xla_model as xm
+                    xm.mark_step()
+
                 with torch.no_grad():
-                    latent_metrics = compute_latent_metrics(outputs['target_latents'])
+                    # Transfer to CPU ONCE, then compute metrics without graph breaks
+                    target_lat_cpu = outputs['target_latents'].detach().cpu()
+                    logits_cpu = outputs['decoder_logits'].detach().cpu()
+                    final_state_cpu = batch['final_state'].detach().cpu() if isinstance(batch['final_state'], torch.Tensor) else batch['final_state']
+                    states_cpu = batch['states'].detach().cpu()
+                    target_states_cpu = batch['target_states'].detach().cpu()
+                    temporal_mask_cpu = batch.get('temporal_mask', None)
+                    if temporal_mask_cpu is not None and isinstance(temporal_mask_cpu, torch.Tensor):
+                        temporal_mask_cpu = temporal_mask_cpu.detach().cpu()
+
+                    latent_metrics = compute_latent_metrics(target_lat_cpu)
                     pred_metrics = compute_prediction_metrics(
-                        outputs['decoder_logits'],
-                        batch['final_state'],
-                        batch.get('temporal_mask', None)
+                        logits_cpu,
+                        final_state_cpu,
+                        temporal_mask_cpu
                     )
                     grad_metrics = compute_gradient_metrics(model)
-                    data_metrics = compute_data_statistics(batch['states'], batch['target_states'])
+                    data_metrics = compute_data_statistics(states_cpu, target_states_cpu)
+
+                    # Materialize loss_dict values to Python floats for logging
+                    loss_dict_cpu = {}
+                    for k_name, v_val in loss_dict.items():
+                        if isinstance(v_val, torch.Tensor):
+                            loss_dict_cpu[k_name] = v_val.item()
+                        else:
+                            loss_dict_cpu[k_name] = v_val
 
                     # Aggregate all metrics
                     metrics = {
                         'epoch': epoch + 1,
                         'batch': batch_idx,
                         'lr': optimizer.param_groups[0]['lr'] if not args.deepspeed else args.lr,
-                        **loss_dict,
+                        **loss_dict_cpu,
                         **latent_metrics,
                         **pred_metrics,
                         **grad_metrics,
@@ -387,19 +422,19 @@ def train():
 
                         # Print critical metrics
                         print(f"Epoch [{epoch+1}/{args.epochs}] Batch [{batch_idx}/{len(dataloader)}]")
-                        print(f"  Loss: {loss.item():.4f} | JEPA: {loss_dict['jepa_loss']:.4f} | Recon: {loss_dict['recon_loss']:.4f} | Std: {loss_dict['std_loss']:.4f} | Policy: {loss_dict['policy_loss']:.4f}")
+                        print(f"  Loss: {loss_dict_cpu['loss']:.4f} | JEPA: {loss_dict_cpu['jepa_loss']:.4f} | Recon: {loss_dict_cpu['recon_loss']:.4f} | Std: {loss_dict_cpu['std_loss']:.4f} | Policy: {loss_dict_cpu['policy_loss']:.4f}")
                         print(f"  Latent: std={latent_metrics['latent_std_mean']:.3f} rank={latent_metrics['effective_rank']:.1f} corr={latent_metrics['latent_correlation_max']:.3f}")
                         print(f"  Accuracy: pixel={pred_metrics['pixel_accuracy']:.3f} fg={pred_metrics['foreground_accuracy']:.3f} bg={pred_metrics['background_accuracy']:.3f}")
                         if args.compute_temporal_masks:
                             print(f"  Temporal: changed={pred_metrics['changed_pixel_accuracy']:.3f} unchanged={pred_metrics['unchanged_pixel_accuracy']:.3f}")
                         print(f"  Data: noop={data_metrics['noop_ratio']:.3f} fg_ratio={data_metrics['foreground_ratio']:.3f}")
                         if args.use_vicreg:
-                            print(f"  VICReg: cov_loss={loss_dict['cov_loss']:.4f}")
+                            print(f"  VICReg: cov_loss={loss_dict_cpu['cov_loss']:.4f}")
                         if args.multistep_k > 1:
-                            print(f"  MultiStep: loss={loss_dict['multistep_jepa_loss']:.4f}")
+                            print(f"  MultiStep: loss={loss_dict_cpu['multistep_jepa_loss']:.4f}")
 
         if is_main_process:
-            avg_loss = total_loss / len(dataloader)
+            avg_loss = (total_loss / len(dataloader)).item() if isinstance(total_loss, torch.Tensor) else total_loss / len(dataloader)
             print(f"Epoch [{epoch+1}/{args.epochs}] Average Loss: {avg_loss:.4f}")
 
             # Save Checkpoint

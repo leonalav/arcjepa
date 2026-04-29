@@ -231,14 +231,14 @@ def pure_chunk_gated_delta_rule(
     A = -(KKt * L_mask).masked_fill(mask_upper, 0)  # naive.py line 130
 
     # Sequential forward substitution (naive.py lines 131-132).
-    # For row i: A[i,:i] += A[i,:i,None] @ A[:i,:i]  (accumulate over prior rows)
+    # For row i: A[i,:i] += A[i,:i] @ A[:i,:i]  (accumulate over prior rows)
+    # Note: .clone() removed — explicit indexing avoids in-place grad issues,
+    # and the matmul result is a new tensor, so no aliasing conflict.
     for i in range(1, BT):
-        # A[..., i, :i] shape: [B, HV, NC, i]
-        # A[..., :i, :i] shape: [B, HV, NC, i, i]
-        A[..., i, :i] = (
-            A[..., i, :i].clone()
-            + (A[..., i, :i, None].clone() * A[..., :i, :i].clone()).sum(dim=-2)
-        )
+        # A[..., i:i+1, :i] @ A[..., :i, :i] → [B, HV, NC, 1, i]
+        correction = (A[..., i:i+1, :i] @ A[..., :i, :i]).squeeze(-2)
+        A = A.clone()  # single clone per iteration for autograd safety
+        A[..., i, :i] = A[..., i, :i] + correction
 
     # Add identity to get (I + A)^{-1} representation (naive.py line 133).
     eye = torch.eye(BT, dtype=torch.float32, device=q.device)

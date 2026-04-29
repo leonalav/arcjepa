@@ -223,7 +223,7 @@ def compute_data_statistics(
     target_states: torch.Tensor
 ) -> Dict[str, float]:
     """
-    Compute data statistics.
+    Compute data statistics. Expects CPU tensors to avoid XLA graph breaks.
 
     Args:
         states: [B, T, H, W] input states
@@ -234,40 +234,31 @@ def compute_data_statistics(
     """
     B, T, H, W = states.shape
 
-    # No-op ratio: fraction of transitions where s_t == s_{t+1}
-    noop_count = 0
-    total_transitions = 0
-
-    for b in range(B):
-        for t in range(T):
-            if torch.equal(states[b, t], target_states[b, t]):
-                noop_count += 1
-            total_transitions += 1
-
-    noop_ratio = noop_count / total_transitions if total_transitions > 0 else 0.0
+    # No-op ratio: vectorized comparison (no Python loops)
+    # A transition is a no-op if ALL pixels match
+    per_step_match = (states == target_states).reshape(B, T, -1).all(dim=-1)  # [B, T] bool
+    noop_ratio = per_step_match.float().mean().item()
 
     # Foreground ratio: fraction of non-zero pixels
     foreground_ratio = (target_states != 0).float().mean().item()
 
-    # Unique colors per grid
-    unique_colors_list = []
-    for b in range(B):
-        for t in range(T):
-            unique_colors = torch.unique(target_states[b, t]).numel()
-            unique_colors_list.append(unique_colors)
-    unique_colors_mean = np.mean(unique_colors_list) if unique_colors_list else 0.0
+    # Unique colors per grid — use histogram approach (no torch.unique in loop)
+    flat_grids = target_states.reshape(B * T, H * W).float()  # [B*T, H*W]
+    # Count non-zero bins per grid
+    unique_counts = []
+    for i in range(B * T):
+        hist = torch.histc(flat_grids[i], bins=16, min=0, max=15)
+        unique_counts.append((hist > 0).sum().item())
+    unique_colors_mean = np.mean(unique_counts) if unique_counts else 0.0
 
     # Grid entropy (Shannon entropy of pixel distribution)
     entropy_list = []
-    for b in range(B):
-        for t in range(T):
-            grid = target_states[b, t].flatten()
-            # Compute histogram
-            hist = torch.histc(grid.float(), bins=16, min=0, max=15)
-            probs = hist / (hist.sum() + 1e-10)
-            probs = probs[probs > 0]
-            entropy = -(probs * torch.log(probs)).sum().item()
-            entropy_list.append(entropy)
+    for i in range(B * T):
+        hist = torch.histc(flat_grids[i], bins=16, min=0, max=15)
+        probs = hist / (hist.sum() + 1e-10)
+        probs = probs[probs > 0]
+        entropy = -(probs * torch.log(probs)).sum().item()
+        entropy_list.append(entropy)
     grid_entropy_mean = np.mean(entropy_list) if entropy_list else 0.0
 
     return {
