@@ -88,7 +88,9 @@ def train():
 
     # Research extension flags
     parser.add_argument("--use_vicreg", action="store_true", help="Enable VICReg covariance loss")
-    parser.add_argument("--vicreg_weight", type=float, default=1.0, help="Weight for VICReg covariance loss")
+    parser.add_argument("--vicreg_weight", type=float, default=25.0, help="VICReg covariance weight on raw latents")
+    parser.add_argument("--var_weight", type=float, default=25.0, help="VICReg variance weight (separate from cov_weight)")
+    parser.add_argument("--proj_cov_weight", type=float, default=5.0, help="VICReg covariance weight on projector outputs (keeps projector spanning full 1024D)")
     parser.add_argument("--multistep_k", type=int, default=1, help="Number of steps for multi-step prediction")
     parser.add_argument("--use_focal", action="store_true", help="Enable focal loss for reconstruction")
     parser.add_argument("--focal_alpha", type=float, default=0.25, help="Focal loss alpha parameter")
@@ -247,6 +249,8 @@ def train():
         recon_weight=args.recon_weight,
         use_vicreg=args.use_vicreg,
         vicreg_weight=args.vicreg_weight,
+        var_weight=args.var_weight,
+        proj_cov_weight=args.proj_cov_weight,
         use_focal=args.use_focal,
         focal_alpha=args.focal_alpha,
         focal_gamma=args.focal_gamma,
@@ -267,7 +271,10 @@ def train():
         online_enc = model.module.online_encoder if hasattr(model, 'module') else model.online_encoder
         target_enc = model.module.target_encoder if hasattr(model, 'module') else model.target_encoder
         
-    ema_updater = EMAUpdater(online_enc, target_enc, tau=0.999)
+    # I-JEPA paper: start tau=0.996, linearly anneal to 1.0 throughout training.
+    # This creates a stronger learning signal early (target diverges more from online)
+    # and gradually stabilises as training converges.
+    ema_updater = EMAUpdater(online_enc, target_enc, tau_start=0.996, tau_end=1.0)
 
     # Initialize logger
     logger = None
@@ -316,6 +323,12 @@ def train():
     for epoch in range(args.epochs):
         if sampler: sampler.set_epoch(epoch)
         total_loss = 0
+
+        # I-JEPA EMA annealing: linearly increase tau from tau_start to tau_end.
+        # progress=0.0 at epoch 0 → tau=tau_start (0.996)
+        # progress=1.0 at last epoch → tau=tau_end (1.0)
+        ema_progress = epoch / max(1, args.epochs - 1)
+        ema_updater.set_progress(ema_progress)
 
         # Curriculum learning for context ratio
         if args.use_curriculum:
@@ -429,9 +442,10 @@ def train():
                             print(f"  Temporal: changed={pred_metrics['changed_pixel_accuracy']:.3f} unchanged={pred_metrics['unchanged_pixel_accuracy']:.3f}")
                         print(f"  Data: noop={data_metrics['noop_ratio']:.3f} fg_ratio={data_metrics['foreground_ratio']:.3f}")
                         if args.use_vicreg:
-                            print(f"  VICReg: cov_loss={loss_dict_cpu['cov_loss']:.4f}")
+                            print(f"  VICReg: cov_raw={loss_dict_cpu['cov_loss_raw']:.4f} cov_proj={loss_dict_cpu['cov_loss_proj']:.4f} std={loss_dict_cpu['std_loss']:.4f}")
                         if args.multistep_k > 1:
                             print(f"  MultiStep: loss={loss_dict_cpu['multistep_jepa_loss']:.4f}")
+                        print(f"  EMA tau={ema_updater.tau:.5f}")
 
         # ── Epoch End ────────────────────────────────────────────────────────────
         # CRITICAL: wait_for_everyone() is a collective barrier — ALL 8 processes
