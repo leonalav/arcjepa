@@ -8,6 +8,18 @@ import torch.distributed as dist
 from pathlib import Path
 import argparse
 import sys
+
+try:
+    import torch_xla
+    import torch_xla.core.xla_model as xm
+    if hasattr(torch, '_register_device_module'):
+        torch._register_device_module('xla', torch_xla)
+    else:
+        torch.xla = torch_xla
+    IS_TPU = True
+except ImportError:
+    IS_TPU = False
+
 torch.multiprocessing.set_sharing_strategy('file_system')
 # Detect project root dynamically
 PROJECT_ROOT = Path(__file__).parent.resolve()
@@ -47,6 +59,17 @@ def setup_dist(local_rank_arg=-1):
         # Single GPU / CPU
         return 0, 1, 0
 
+def check_training_files_exist(data_path: Path) -> bool:
+    """
+    Look into the folder and check the existence of training files.
+    If files exist (either in root or train/ split), return True to skip processing.
+    """
+    try:
+        next(data_path.rglob("*.jsonl"))
+        return True
+    except StopIteration:
+        return False
+
 def train():
     parser = argparse.ArgumentParser(description="ARC-JEPA Training Loop")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size per GPU")
@@ -77,19 +100,17 @@ def train():
 
     args = parser.parse_args()
 
-    # Detect TPU dynamically
-    try:
-        import torch_xla
-        is_tpu = True
-    except ImportError:
-        is_tpu = False
+    # Tailor config for TPU v5e-8 (16GB HBM) to maximize throughput securely
+    if IS_TPU and args.batch_size > 4:
+        print(f"TPU detected: Tailoring batch_size from {args.batch_size} to 4 to prevent HBM OOM while maximizing throughput.")
+        args.batch_size = 4
 
     # gdntpu (pure-PyTorch) is used on any non-CUDA path (TPU or CPU).
     # It requires strictly static sequence lengths so XLA can trace and cache
     # a single compiled graph.  We must never feed a partial final batch.
-    use_gdntpu = is_tpu or not torch.cuda.is_available()
+    use_gdntpu = IS_TPU or not torch.cuda.is_available()
 
-    if is_tpu:
+    if IS_TPU:
         from accelerate import Accelerator
         accelerator = Accelerator()
         device = accelerator.device
@@ -110,17 +131,20 @@ def train():
         data_path.mkdir(parents=True, exist_ok=True)
     
     # Wait for directory creation if multi-gpu
-    if is_tpu:
+    if IS_TPU:
         accelerator.wait_for_everyone()
     elif world_size > 1: dist.barrier()
     
     # Check if files exist and generate if necessary (Main process only)
-    if is_main_process and not list(data_path.glob("*.jsonl")):
-        print(f"No recordings found in {args.data_dir}. Generating real trajectories via ARC-AGI...")
-        create_mock_trajectory(args.data_dir, num_trajectories=args.num_trajectories)
+    if is_main_process:
+        if not check_training_files_exist(data_path):
+            print(f"No recordings found in {args.data_dir} (or its subdirectories). Generating real trajectories via ARC-AGI...")
+            create_mock_trajectory(args.data_dir, num_trajectories=args.num_trajectories)
+        else:
+            print(f"Training files found in {args.data_dir}. Skipping data generation.")
         
     # ALL processes wait for generation to finish
-    if is_tpu:
+    if IS_TPU:
         accelerator.wait_for_everyone()
     elif world_size > 1: dist.barrier()
     
@@ -156,7 +180,7 @@ def train():
     if is_main_process:
         dataset.validate_arc_compliance()
 
-    if is_tpu:
+    if IS_TPU:
         sampler = None
     else:
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
@@ -168,7 +192,7 @@ def train():
         shuffle=(sampler is None),
         sampler=sampler,
         num_workers=0,
-        pin_memory=not is_tpu,
+        pin_memory=not IS_TPU,
         # drop_last MUST be True on any path that uses gdntpu (TPU or CPU).
         # XLA traces one compiled graph per unique input shape.  A partial
         # final batch would create a second distinct graph, doubling compile
@@ -183,11 +207,11 @@ def train():
         num_gdn_heads=8,  # Increased from 4
         multistep_k=args.multistep_k
     )
-    if not is_tpu:
+    if not IS_TPU:
         model = model.to(device)
     
     # DeepSpeed Integration (Optional)
-    if not is_tpu and args.deepspeed:
+    if not IS_TPU and args.deepspeed:
         try:
             import deepspeed
             # DeepSpeed expects local_rank in its init
@@ -206,7 +230,7 @@ def train():
             args.deepspeed = False
 
     # Standard DDP if multi-gpu and not using DeepSpeed
-    if not is_tpu and world_size > 1 and not args.deepspeed:
+    if not IS_TPU and world_size > 1 and not args.deepspeed:
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
     criterion = ARCJPELoss(
@@ -218,14 +242,14 @@ def train():
         focal_gamma=args.focal_gamma,
         temporal_weight_multiplier=args.temporal_weight
     )
-    if is_tpu or not args.deepspeed:
+    if IS_TPU or not args.deepspeed:
         optimizer = optim.AdamW(model.parameters(), lr=args.lr)
         
-    if is_tpu:
+    if IS_TPU:
         model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
     
     # EMA Updater
-    if is_tpu:
+    if IS_TPU:
         unwrapped = accelerator.unwrap_model(model)
         online_enc = unwrapped.online_encoder
         target_enc = unwrapped.target_encoder
@@ -297,16 +321,16 @@ def train():
                 if args.use_curriculum:
                     print(f"  Context ratio: {context_ratio:.2f}")
 
-            if not is_tpu:
+            if not IS_TPU:
                 batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
-            if args.deepspeed and not is_tpu:
+            if args.deepspeed and not IS_TPU:
                 outputs = model(batch, context_ratio=context_ratio, use_teacher_forcing=True)
                 loss_dict = criterion(outputs, batch)
                 loss = loss_dict['loss']
                 model.backward(loss)
                 model.step()
-            elif is_tpu:
+            elif IS_TPU:
                 optimizer.zero_grad()
                 outputs = model(batch, context_ratio=context_ratio, use_teacher_forcing=True)
                 loss_dict = criterion(outputs, batch)
@@ -381,7 +405,7 @@ def train():
             # Save Checkpoint
             save_path = Path(args.output_dir)
             save_path.mkdir(exist_ok=True)
-            if is_tpu:
+            if IS_TPU:
                 accelerator.wait_for_everyone()
                 unwrapped_model = accelerator.unwrap_model(model)
                 if is_main_process:
@@ -404,7 +428,7 @@ def train():
         print("Training Complete!")
         if args.logger == "tensorboard" and logger is not None:
             logger.close()
-    if not is_tpu and world_size > 1: dist.destroy_process_group()
+    if not IS_TPU and world_size > 1: dist.destroy_process_group()
 
 if __name__ == "__main__":
     train()

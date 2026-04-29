@@ -106,6 +106,11 @@ class ARCJEPAWorldModel(nn.Module):
         # Flatten time for spatial encoding
         grids = grids.reshape(b * t, h, w)
         
+        # Tailor max_batch_size for XLA to fit within 16GB TPU HBM limits 
+        # (Attention over 4096 tokens at MB=16 takes >16GB alone)
+        if grids.device.type == 'xla' and max_batch_size == 16:
+            max_batch_size = 8
+            
         all_latents = []
         # Process in chunks to prevent O(N^2) self-attention from OOMing the GPU
         for i in range(0, b * t, max_batch_size):
@@ -122,7 +127,7 @@ class ARCJEPAWorldModel(nn.Module):
             # for EVERY chunk for the backward pass, causing an inevitable OOM.
             if x.requires_grad:
                 from torch.utils.checkpoint import checkpoint
-                chunk_latents = checkpoint(encoder, x, use_reentrant=False, preserve_rng_state=False)
+                chunk_latents = checkpoint(encoder, x, use_reentrant=True, preserve_rng_state=False)
             else:
                 chunk_latents = encoder(x) # [MB, d_model]
                 

@@ -36,31 +36,55 @@ class ARCTrajectoryDataset(Dataset):
         self.compute_temporal_masks = compute_temporal_masks
         self.filter_noops = filter_noops
         self.chunks = []
+        self.trajectories_grids = []
+        self.trajectories_actions = []
+        self.trajectories_xs = []
+        self.trajectories_ys = []
 
         self._load_recordings(recording_files)
 
     def _load_recordings(self, recording_files: List[str]):
         for file_path in recording_files:
-            trajectory = []
+            grids = []
+            actions = []
+            xs = []
+            ys = []
             with open(file_path, 'r') as f:
                 for line in f:
                     if not line.strip():
                         continue
                     frame_data = json.loads(line)
-                    trajectory.append(self._preprocess_frame(frame_data))
+                    processed = self._preprocess_frame(frame_data)
+                    grids.append(processed['grid'].to(torch.uint8))
+                    actions.append(processed['action_type'])
+                    xs.append(processed['x'])
+                    ys.append(processed['y'])
 
-            # Chunk the trajectory into sliding windows
-            if len(trajectory) < 2: # Need at least (s_t, a_t, s_{t+1})
+            traj_len = len(grids)
+            if traj_len < 2: # Need at least (s_t, a_t, s_{t+1})
                 continue
 
-            for i in range(0, len(trajectory) - self.window_size, self.stride):
-                chunk = trajectory[i : i + self.window_size + 1] # +1 for target state
+            grids_tensor = torch.stack(grids)
+            actions_tensor = torch.tensor(actions, dtype=torch.uint8)
+            xs_tensor = torch.tensor(xs, dtype=torch.uint8)
+            ys_tensor = torch.tensor(ys, dtype=torch.uint8)
+            
+            traj_idx = len(self.trajectories_grids)
 
+            # Chunk the trajectory into sliding windows
+            for i in range(0, traj_len - self.window_size, self.stride):
                 # Filter no-op chunks (not trajectories) if requested
-                if self.filter_noops and self._is_noop_chunk(chunk):
-                    continue
+                if self.filter_noops:
+                    chunk_grids = grids_tensor[i : i + self.window_size + 1]
+                    if torch.all(chunk_grids == chunk_grids[0]):
+                        continue
 
-                self.chunks.append(chunk)
+                self.chunks.append((traj_idx, i))
+
+            self.trajectories_grids.append(grids_tensor)
+            self.trajectories_actions.append(actions_tensor)
+            self.trajectories_xs.append(xs_tensor)
+            self.trajectories_ys.append(ys_tensor)
 
     def _preprocess_frame(self, frame_data: Dict[str, Any]) -> Dict[str, Any]:
         # Extract grid via aggressive recursive search to bypass undocumented JSON schema changes
@@ -132,22 +156,24 @@ class ARCTrajectoryDataset(Dataset):
         return len(self.chunks)
 
     def __getitem__(self, idx):
-        chunk = self.chunks[idx]
-
-        grids = torch.stack([step['grid'] for step in chunk])
-        action_types = torch.tensor([step['action_type'] for step in chunk[:-1]], dtype=torch.long)
-        xs = torch.tensor([step['x'] for step in chunk[:-1]], dtype=torch.long)
-        ys = torch.tensor([step['y'] for step in chunk[:-1]], dtype=torch.long)
+        traj_idx, start_idx = self.chunks[idx]
+        end_idx = start_idx + self.window_size + 1
+        
+        # Extract and convert back to long for embedding layers
+        grids = self.trajectories_grids[traj_idx][start_idx:end_idx].long()
+        actions = self.trajectories_actions[traj_idx][start_idx:end_idx-1].long()
+        xs = self.trajectories_xs[traj_idx][start_idx:end_idx-1].long()
+        ys = self.trajectories_ys[traj_idx][start_idx:end_idx-1].long()
 
         # Input: steps 0 to T-1 (grids and actions)
         # Target: steps 1 to T (grids for latent prediction)
         result = {
             'states': grids[:-1],          # [T, 64, 64]
-            'actions': action_types,        # [T]
-            'coords_x': xs,                 # [T]
-            'coords_y': ys,                 # [T]
-            'target_states': grids[1:],     # [T, 64, 64]
-            'final_state': grids[-1]        # [64, 64] (for reconstruction loss)
+            'actions': actions,            # [T]
+            'coords_x': xs,                # [T]
+            'coords_y': ys,                # [T]
+            'target_states': grids[1:],    # [T, 64, 64]
+            'final_state': grids[-1]       # [64, 64] (for reconstruction loss)
         }
 
         # Compute temporal masks if requested
@@ -170,33 +196,19 @@ class ARCTrajectoryDataset(Dataset):
         """
         return (states != target_states).float()
 
-    def _is_noop_chunk(self, chunk: List[Dict]) -> bool:
-        """
-        Check if a specific chunk consists entirely of no-op transitions (all grids identical).
-
-        Args:
-            chunk: List of preprocessed frames in this sliding window
-
-        Returns:
-            True if all grids in chunk are identical, False otherwise
-        """
-        if len(chunk) < 2:
-            return True
-
-        first_grid = chunk[0]['grid']
-        for step in chunk[1:]:
-            if not torch.equal(first_grid, step['grid']):
-                return False
-
-        return True
-
     def validate_arc_compliance(self):
         """Validate dataset respects ARC-AGI-3 specifications"""
         print(f"Validating {len(self.chunks)} chunks for ARC-AGI-3 compliance...")
 
-        for chunk_idx, chunk in enumerate(self.chunks):
-            for step_idx, step in enumerate(chunk):
-                grid = step['grid']
+        for chunk_idx, (traj_idx, start_idx) in enumerate(self.chunks):
+            end_idx = start_idx + self.window_size + 1
+            grids = self.trajectories_grids[traj_idx][start_idx:end_idx]
+            actions = self.trajectories_actions[traj_idx][start_idx:end_idx-1]
+            xs = self.trajectories_xs[traj_idx][start_idx:end_idx-1]
+            ys = self.trajectories_ys[traj_idx][start_idx:end_idx-1]
+            
+            for step_idx in range(len(grids)):
+                grid = grids[step_idx]
 
                 # Check grid size
                 assert grid.shape == (64, 64), \
@@ -206,13 +218,14 @@ class ARCTrajectoryDataset(Dataset):
                 assert grid.min() >= 0 and grid.max() <= 15, \
                     f"Chunk {chunk_idx}, Step {step_idx}: Invalid color range [{grid.min()}, {grid.max()}]"
 
-                # Check action type
-                assert 0 <= step['action_type'] <= 8, \
-                    f"Chunk {chunk_idx}, Step {step_idx}: Invalid action type {step['action_type']}"
+                if step_idx < len(actions):
+                    # Check action type
+                    assert 0 <= actions[step_idx] <= 8, \
+                        f"Chunk {chunk_idx}, Step {step_idx}: Invalid action type {actions[step_idx]}"
 
-                # Check coordinates
-                assert 0 <= step['x'] < 64 and 0 <= step['y'] < 64, \
-                    f"Chunk {chunk_idx}, Step {step_idx}: Invalid coords ({step['x']}, {step['y']})"
+                    # Check coordinates
+                    assert 0 <= xs[step_idx] < 64 and 0 <= ys[step_idx] < 64, \
+                        f"Chunk {chunk_idx}, Step {step_idx}: Invalid coords ({xs[step_idx]}, {ys[step_idx]})"
 
         print(f"✓ Dataset validation passed: {len(self.chunks)} chunks comply with ARC-AGI-3 specs")
 
