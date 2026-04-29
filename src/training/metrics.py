@@ -4,12 +4,13 @@ import numpy as np
 from typing import Dict, Optional
 
 
-def compute_latent_metrics(target_latents: torch.Tensor) -> Dict[str, float]:
+def compute_latent_metrics(target_latents: torch.Tensor, seq_mask: Optional[torch.Tensor] = None) -> Dict[str, float]:
     """
     Compute latent space health metrics.
 
     Args:
         target_latents: [B, T, D] or [B, D] tensor of latent representations
+        seq_mask: [B, T] optional boolean mask to filter padded frames
 
     Returns:
         Dict with std_mean, std_min, std_max, effective_rank, correlation_max, norm_mean
@@ -17,9 +18,25 @@ def compute_latent_metrics(target_latents: torch.Tensor) -> Dict[str, float]:
     # Flatten batch and time dimensions if needed
     if target_latents.dim() == 3:
         B, T, D = target_latents.shape
-        latents = target_latents.reshape(B * T, D)
+        if seq_mask is not None:
+            # Mask could be shorter than T (T_pred vs T)
+            T_mask = min(T, seq_mask.shape[1])
+            flat_mask = seq_mask[:, :T_mask].reshape(-1).bool()
+            latents = target_latents[:, :T_mask, :].reshape(B * T_mask, D)[flat_mask]
+        else:
+            latents = target_latents.reshape(B * T, D)
     else:
         latents = target_latents
+
+    if latents.shape[0] < 2:
+        return {
+            'latent_std_mean': 0.0,
+            'latent_std_min': 0.0,
+            'latent_std_max': 0.0,
+            'effective_rank': 1.0,
+            'latent_norm_mean': 0.0,
+            'latent_correlation_max': 0.0
+        }
 
     # Standard deviation statistics
     # Use correction=0 (biased) to prevent NaN on single-sample shards
@@ -81,7 +98,8 @@ def compute_latent_metrics(target_latents: torch.Tensor) -> Dict[str, float]:
 def compute_prediction_metrics(
     decoder_logits: torch.Tensor,
     final_state: torch.Tensor,
-    temporal_mask: Optional[torch.Tensor] = None
+    temporal_mask: Optional[torch.Tensor] = None,
+    states: Optional[torch.Tensor] = None
 ) -> Dict[str, float]:
     """
     Compute prediction quality metrics.
@@ -90,6 +108,7 @@ def compute_prediction_metrics(
         decoder_logits: [B, 16, H, W] logits from decoder
         final_state: [B, H, W] ground truth grid
         temporal_mask: [B, H, W] optional binary mask of changed pixels
+        states: [B, T, H, W] optional full trajectory to find the active grid
 
     Returns:
         Dict with pixel_accuracy, foreground_accuracy, background_accuracy, etc.
@@ -97,13 +116,28 @@ def compute_prediction_metrics(
     # Get predictions
     predictions = torch.argmax(decoder_logits, dim=1)  # [B, H, W]
 
-    # Overall pixel accuracy
-    correct = (predictions == final_state).float()
-    pixel_accuracy = correct.mean().item()
+    # Find the active bounding box (fixes Deception 8: 1/16 accuracy baseline over padded canvas)
+    active_mask = torch.zeros_like(final_state, dtype=torch.bool)
+    for b in range(final_state.shape[0]):
+        active_grid = final_state[b]
+        if states is not None:
+            active_grid = torch.max(active_grid, states[b].max(dim=0)[0])
+            
+        non_zero = torch.nonzero(active_grid)
+        if len(non_zero) > 0:
+            min_r, min_c = non_zero.min(dim=0)[0]
+            max_r, max_c = non_zero.max(dim=0)[0]
+            active_mask[b, min_r:max_r+1, min_c:max_c+1] = True
+        else:
+            active_mask[b] = True
 
-    # Foreground vs background accuracy
-    foreground_mask = (final_state != 0)
-    background_mask = (final_state == 0)
+    # Overall pixel accuracy restricted to active grid
+    correct = (predictions == final_state).float()
+    pixel_accuracy = correct[active_mask].mean().item() if active_mask.any() else correct.mean().item()
+
+    # Foreground vs background accuracy restricted to active grid
+    foreground_mask = (final_state != 0) & active_mask
+    background_mask = (final_state == 0) & active_mask
 
     if foreground_mask.any():
         foreground_accuracy = correct[foreground_mask].mean().item()
@@ -220,7 +254,8 @@ def compute_gradient_metrics(model: nn.Module) -> Dict[str, float]:
 
 def compute_data_statistics(
     states: torch.Tensor,
-    target_states: torch.Tensor
+    target_states: torch.Tensor,
+    seq_mask: Optional[torch.Tensor] = None
 ) -> Dict[str, float]:
     """
     Compute data statistics. Expects CPU tensors to avoid XLA graph breaks.
@@ -228,32 +263,57 @@ def compute_data_statistics(
     Args:
         states: [B, T, H, W] input states
         target_states: [B, T, H, W] target states
+        seq_mask: [B, T] optional mask of valid unpadded frames
 
     Returns:
         Dict with noop_ratio, foreground_ratio, unique_colors_mean, grid_entropy_mean
     """
     B, T, H, W = states.shape
 
-    # No-op ratio: vectorized comparison (no Python loops)
-    # A transition is a no-op if ALL pixels match
-    per_step_match = (states == target_states).reshape(B, T, -1).all(dim=-1)  # [B, T] bool
-    noop_ratio = per_step_match.float().mean().item()
+    # Deception 2 Fix: noop_ratio was measuring padding. Rename conceptually to padding_ratio (kept as noop_ratio for compatibility)
+    if seq_mask is not None:
+        padding_ratio = 1.0 - seq_mask.float().mean().item()
+        
+        # Filter valid states for metrics
+        T_mask = min(T, seq_mask.shape[1])
+        flat_mask = seq_mask[:, :T_mask].reshape(-1).bool()
+        valid_target_states = target_states[:, :T_mask, :, :].reshape(B * T_mask, H, W)[flat_mask]
+    else:
+        padding_ratio = (states == target_states).reshape(B, T, -1).all(dim=-1).float().mean().item()
+        valid_target_states = target_states.reshape(B * T, H, W)
 
-    # Foreground ratio: fraction of non-zero pixels
-    foreground_ratio = (target_states != 0).float().mean().item()
+    if len(valid_target_states) == 0:
+        return {'noop_ratio': padding_ratio, 'foreground_ratio': 0.0, 'unique_colors_mean': 0.0, 'grid_entropy_mean': 0.0}
 
-    # Unique colors per grid — use histogram approach (no torch.unique in loop)
-    flat_grids = target_states.reshape(B * T, H * W).float()  # [B*T, H*W]
-    # Count non-zero bins per grid
+    # Deception 1 Fix: Calculate foreground ratio ONLY within the active grid of valid states
+    active_mask = torch.zeros_like(valid_target_states, dtype=torch.bool)
+    for i in range(valid_target_states.shape[0]):
+        non_zero = torch.nonzero(valid_target_states[i])
+        if len(non_zero) > 0:
+            min_r, min_c = non_zero.min(dim=0)[0]
+            max_r, max_c = non_zero.max(dim=0)[0]
+            active_mask[i, min_r:max_r+1, min_c:max_c+1] = True
+        else:
+            active_mask[i] = True
+
+    if active_mask.any():
+        foreground_ratio = (valid_target_states[active_mask] != 0).float().mean().item()
+    else:
+        foreground_ratio = 0.0
+
+    # Unique colors per valid grid
+    N_valid = valid_target_states.shape[0]
+    flat_grids = valid_target_states.reshape(N_valid, H * W).float()  # [N_valid, H*W]
+    
     unique_counts = []
-    for i in range(B * T):
+    for i in range(N_valid):
         hist = torch.histc(flat_grids[i], bins=16, min=0, max=15)
         unique_counts.append((hist > 0).sum().item())
     unique_colors_mean = np.mean(unique_counts) if unique_counts else 0.0
 
-    # Grid entropy (Shannon entropy of pixel distribution)
+    # Grid entropy per valid grid
     entropy_list = []
-    for i in range(B * T):
+    for i in range(N_valid):
         hist = torch.histc(flat_grids[i], bins=16, min=0, max=15)
         probs = hist / (hist.sum() + 1e-10)
         probs = probs[probs > 0]
@@ -262,7 +322,7 @@ def compute_data_statistics(
     grid_entropy_mean = np.mean(entropy_list) if entropy_list else 0.0
 
     return {
-        'noop_ratio': noop_ratio,
+        'noop_ratio': padding_ratio,
         'foreground_ratio': foreground_ratio,
         'unique_colors_mean': unique_colors_mean,
         'grid_entropy_mean': grid_entropy_mean

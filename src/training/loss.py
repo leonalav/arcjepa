@@ -142,34 +142,35 @@ class ARCJPELoss(nn.Module):
             focal_loss = torch.tensor(0.0, device=target_latents.device)
 
         # ── 3. Variance Regularization on RAW latents (primary anti-collapse) ──
-        # Flatten [B, T, D] → [B*T, D] for sufficient sample count.
-        # NOTE: target_latents is produced under torch.no_grad() in world_model.py
-        # (target encoder is EMA-updated, not gradient-updated). So std_target
-        # contributes a non-zero loss VALUE but zero GRADIENT — it is informational
-        # only. The gradient comes entirely from flat_pred_raw (online encoder).
         flat_target_raw = target_latents.reshape(-1, target_latents.size(-1))
         flat_pred_raw   = pred_latents.reshape(-1, pred_latents.size(-1))
 
-        # NEW: Filter out padded steps so variance is only computed on real ARC frames
         seq_mask = targets.get('seq_mask', None)
         if seq_mask is not None:
             T_pred = pred_latents.size(1)
-            # Create a 1D boolean mask matching the flattened latents
-            flat_mask = seq_mask[:, :T_pred].reshape(-1).bool()
+            # Expand mask to match latents shape: [B*T_pred, 1]
+            flat_mask = seq_mask[:, :T_pred].reshape(-1, 1)
             
-            # Apply mask
-            flat_target_raw = flat_target_raw[flat_mask]
-            flat_pred_raw = flat_pred_raw[flat_mask]
-
-        # unbiased=False to prevent NaN on small effective batch sizes
-        std_pred   = torch.sqrt(flat_pred_raw.var(dim=0, unbiased=False) + 1e-4)
-        # Target std is detached — use only for monitoring/loss value balance
-        with torch.no_grad():
-            std_target = torch.sqrt(flat_target_raw.var(dim=0, unbiased=False) + 1e-4)
+            # --- XLA-SAFE MASKED VARIANCE ---
+            valid_count = flat_mask.sum() + 1e-8
+            
+            # 1. Masked Mean
+            mean_pred = (flat_pred_raw * flat_mask).sum(dim=0, keepdim=True) / valid_count
+            mean_target = (flat_target_raw * flat_mask).sum(dim=0, keepdim=True) / valid_count
+            
+            # 2. Masked Variance (mean of squared deviations)
+            var_pred = (((flat_pred_raw - mean_pred) ** 2) * flat_mask).sum(dim=0) / valid_count
+            var_target = (((flat_target_raw - mean_target) ** 2) * flat_mask).sum(dim=0) / valid_count
+            
+            std_pred = torch.sqrt(var_pred + 1e-4)
+            with torch.no_grad():
+                std_target = torch.sqrt(var_target + 1e-4)
+        else:
+            std_pred   = torch.sqrt(flat_pred_raw.var(dim=0, unbiased=False) + 1e-4)
+            with torch.no_grad():
+                std_target = torch.sqrt(flat_target_raw.var(dim=0, unbiased=False) + 1e-4)
 
         # VICReg-standard hinge: penalise dimensions whose std < 1.0
-        # Only pred has live gradients; target term is a constant added for
-        # loss scale symmetry and can be dropped if needed.
         std_loss = (
             torch.mean(F.relu(1.0 - std_target)) +
             torch.mean(F.relu(1.0 - std_pred))
@@ -197,22 +198,28 @@ class ARCJPELoss(nn.Module):
 
         # ── 5. Covariance Regularization ─────────────────────────────────────
         if self.use_vicreg:
-            # PRIMARY: Covariance on raw 512-dim PRED latents (online encoder).
-            #
-            # CRITICAL: target_latents is produced under torch.no_grad() in
-            # world_model.py (EMA encoder). Applying cov loss to target_latents
-            # gives a non-zero scalar but ZERO gradient — a silent no-op.
-            # We use pred_latents (online encoder, fully differentiable).
-            cov_loss_raw = self.vicreg_cov_loss(pred_latents)
+            if seq_mask is not None:
+                # --- XLA-SAFE COVARIANCE MASKING ---
+                # We replace padded frames with the mean of the valid frames.
+                # This ensures their deviation from the mean is exactly 0, so 
+                # they contribute nothing to the covariance matrix, all without 
+                # changing the tensor shape.
+                T_pred = pred_latents.size(1)
+                mask_3d = seq_mask[:, :T_pred].unsqueeze(-1)  # [B, T_pred, 1]
+                
+                valid_count = mask_3d.sum() + 1e-8
+                
+                pred_mean = (pred_latents * mask_3d).sum(dim=(0,1), keepdim=True) / valid_count
+                safe_pred_latents = (pred_latents * mask_3d) + (pred_mean * (1.0 - mask_3d))
+                
+                proj_mean = (projected_pred * mask_3d).sum(dim=(0,1), keepdim=True) / valid_count
+                safe_projected_pred = (projected_pred * mask_3d) + (proj_mean * (1.0 - mask_3d))
+            else:
+                safe_pred_latents = pred_latents
+                safe_projected_pred = projected_pred
 
-            # SECONDARY: Covariance on 1024-dim projector PRED outputs.
-            # projected_pred IS differentiable (online encoder → projector).
-            # Keeps the projector incentivised to span its full dimensionality.
-            # NOTE: The projector is no longer used in the JEPA invariance loss;
-            # its only role now is to provide a higher-dimensional surface for
-            # this covariance penalty. proj_cov_weight is kept at 5.0 (reduced)
-            # because a full weight here would over-constrain the projector.
-            cov_loss_proj = self.vicreg_cov_loss(projected_pred)
+            cov_loss_raw = self.vicreg_cov_loss(safe_pred_latents)
+            cov_loss_proj = self.vicreg_cov_loss(safe_projected_pred)
 
             cov_loss = (
                 self.vicreg_weight   * cov_loss_raw +

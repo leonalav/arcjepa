@@ -203,7 +203,7 @@ def train():
         batch_size=args.batch_size,
         shuffle=(sampler is None),
         sampler=sampler,
-        num_workers=0,
+        num_workers=12,
         pin_memory=not IS_TPU,
         # drop_last MUST be True on any path that uses gdntpu (TPU or CPU).
         # XLA traces one compiled graph per unique input shape.  A partial
@@ -392,14 +392,19 @@ def train():
                     if temporal_mask_cpu is not None and isinstance(temporal_mask_cpu, torch.Tensor):
                         temporal_mask_cpu = temporal_mask_cpu.detach().cpu()
 
-                    latent_metrics = compute_latent_metrics(target_lat_cpu)
+                    seq_mask_cpu = batch.get('seq_mask', None)
+                    if seq_mask_cpu is not None and isinstance(seq_mask_cpu, torch.Tensor):
+                        seq_mask_cpu = seq_mask_cpu.detach().cpu()
+
+                    latent_metrics = compute_latent_metrics(target_lat_cpu, seq_mask=seq_mask_cpu)
                     pred_metrics = compute_prediction_metrics(
                         logits_cpu,
                         final_state_cpu,
-                        temporal_mask_cpu
+                        temporal_mask_cpu,
+                        states_cpu
                     )
                     grad_metrics = compute_gradient_metrics(model)
-                    data_metrics = compute_data_statistics(states_cpu, target_states_cpu)
+                    data_metrics = compute_data_statistics(states_cpu, target_states_cpu, seq_mask=seq_mask_cpu)
 
                     # Materialize loss_dict values to Python floats for logging
                     loss_dict_cpu = {}
