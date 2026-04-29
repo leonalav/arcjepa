@@ -1,3 +1,27 @@
+"""
+# 1. Strip the rogue multi-host environment variables
+unset TPU_PROCESS_ADDRESSES
+unset CLOUD_TPU_TASK_ID
+
+# 2. Set the modern XLA backend
+export PJRT_DEVICE=TPU
+
+# 3. Launch
+accelerate launch --num_processes 8 train.py \
+  --batch_size 8 \
+  --epochs 10 \
+  --lr 1e-4 \
+  --context_ratio 0.7 \
+  --recon_weight 1.0 \
+  --use_vicreg \
+  --vicreg_weight 25.0 \
+  --multistep_k 3 \
+  --use_focal \
+  --compute_temporal_masks \
+  --filter_noops \
+  --logger csv
+"""
+
 import torch
 import torch.nn as nn
 import copy

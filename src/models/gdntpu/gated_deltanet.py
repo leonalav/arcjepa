@@ -193,10 +193,10 @@ class GatedDeltaNet(nn.Module):
         batch_size, q_len, _ = hidden_states.shape
 
         # During training always use chunk mode (FLA lines 219-221).
-        if self.training:
-            mode = "chunk"
+        if q_len <= 64:
+            mode = "fused_recurrent"
         else:
-            mode = "fused_recurrent" if q_len <= 64 else self.mode
+            mode = "chunk" if self.training else self.mode
 
         # ---- Project and (optionally) short-conv q, k, v ---------------
         if self.use_short_conv:
