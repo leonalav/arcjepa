@@ -281,25 +281,29 @@ class FastHFARCDataset(Dataset):
     def __getitem__(self, idx):
         item = self.hf_ds[idx]
         
-        # Cast Arrow numpy arrays back directly into long tensors
         states_raw = torch.tensor(item['states'], dtype=torch.long)
         actions_raw = torch.tensor(item['actions'], dtype=torch.long)
         coords_x_raw = torch.tensor(item['coords_x'], dtype=torch.long)
         coords_y_raw = torch.tensor(item['coords_y'], dtype=torch.long)
         target_states_raw = torch.tensor(item['target_states'], dtype=torch.long)
         
-        # states and target_states have T steps; actions/coords have T steps
-        # We need T = max_seq_len for all of them
         T = self.max_seq_len
-        
         states = self._pad_or_window(states_raw, T)
         actions = self._pad_or_window(actions_raw, T)
         coords_x = self._pad_or_window(coords_x_raw, T)
         coords_y = self._pad_or_window(coords_y_raw, T)
         target_states = self._pad_or_window(target_states_raw, T)
         
-        # final_state is the last target state
-        final_state = target_states[-1]  # [64, 64]
+        final_state = target_states[-1]
+        
+        # THE TRUE FIX: Only keep steps where the grid ACTUALLY changed.
+        # If the grid is identical across time (a padded no-op), mask it out.
+        # We flatten the spatial dims to check if all pixels are identical.
+        s_flat = states.reshape(T, -1)
+        t_flat = target_states.reshape(T, -1)
+        
+        # 1.0 if there is any difference, 0.0 if perfectly identical
+        seq_mask = (s_flat != t_flat).any(dim=1).float()
         
         result = {
             'states': states,
@@ -308,10 +312,11 @@ class FastHFARCDataset(Dataset):
             'coords_y': coords_y,
             'target_states': target_states,
             'final_state': final_state,
+            'seq_mask': seq_mask  # Passes our strict semantic mask to loss.py
         }
         
         if self.compute_temporal_masks:
-            result['temporal_mask'] = (result['states'] != result['target_states']).float()
+            result['temporal_mask'] = (states != target_states).float()
             
         return result
 

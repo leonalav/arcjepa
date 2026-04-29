@@ -109,7 +109,23 @@ class ARCJPELoss(nn.Module):
         # .detach() is belt-and-suspenders: target_latents is already produced
         # under torch.no_grad() in world_model.py, but this documents intent
         # and guards against future refactoring that reattaches the target path.
-        jepa_loss = F.mse_loss(pred_latents, target_latents.detach())
+        seq_mask = targets.get('seq_mask', None)
+        
+        if seq_mask is not None:
+            # pred_latents shape: [B, T_pred, 512]
+            T_pred = pred_latents.shape[1]
+            
+            # Align mask to prediction length and add feature dimension: [B, T_pred, 1]
+            mask = seq_mask[:, :T_pred].unsqueeze(-1)
+            
+            # Compute unreduced L1 (as per V-JEPA paper): [B, T_pred, 512]
+            l1_loss = F.l1_loss(pred_latents, target_latents.detach(), reduction='none')
+            
+            # Mask out the padded timesteps and compute mean over valid steps
+            valid_elements = mask.sum() * l1_loss.shape[-1]
+            jepa_loss = (l1_loss * mask).sum() / (valid_elements + 1e-8)
+        else:
+            jepa_loss = F.l1_loss(pred_latents, target_latents.detach())
 
         # ── 2. Reconstruction Loss ──────────────────────────────────────────
         if self.use_focal:
@@ -133,6 +149,17 @@ class ARCJPELoss(nn.Module):
         # only. The gradient comes entirely from flat_pred_raw (online encoder).
         flat_target_raw = target_latents.reshape(-1, target_latents.size(-1))
         flat_pred_raw   = pred_latents.reshape(-1, pred_latents.size(-1))
+
+        # NEW: Filter out padded steps so variance is only computed on real ARC frames
+        seq_mask = targets.get('seq_mask', None)
+        if seq_mask is not None:
+            T_pred = pred_latents.size(1)
+            # Create a 1D boolean mask matching the flattened latents
+            flat_mask = seq_mask[:, :T_pred].reshape(-1).bool()
+            
+            # Apply mask
+            flat_target_raw = flat_target_raw[flat_mask]
+            flat_pred_raw = flat_pred_raw[flat_mask]
 
         # unbiased=False to prevent NaN on small effective batch sizes
         std_pred   = torch.sqrt(flat_pred_raw.var(dim=0, unbiased=False) + 1e-4)
@@ -198,7 +225,7 @@ class ARCJPELoss(nn.Module):
 
         # ── 6. Multi-step JEPA Loss (auxiliary) ─────────────────────────────
         if 'multistep_pred_latents' in outputs and 'multistep_target_latents' in outputs:
-            multistep_jepa_loss = F.mse_loss(
+            multistep_jepa_loss = F.l1_loss(
                 outputs['multistep_pred_latents'],
                 outputs['multistep_target_latents']
             )
