@@ -37,7 +37,6 @@ mkdir -p /tmp/xla_cache
 unset TPU_PROCESS_ADDRESSES
 unset CLOUD_TPU_TASK_ID
 export PJRT_DEVICE=TPU
-
 accelerate launch --num_processes 8 --mixed_precision bf16 train.py \
   --hf_repo_id "leonidas123/arc3data" \
   --batch_size 4 \

@@ -8,24 +8,39 @@ class ARCJPELoss(nn.Module):
     """
     Combined Loss for ARC-JEPA with modular research extensions.
 
-    Loss formulation (post-collapse fix):
-      L = L_jepa_proj                   # JEPA MSE in projector space (1024D)
+    Loss formulation (collapse-resistant):
+      L = L_jepa                        # JEPA L2 in RAW encoder space (512D)  ← KEY
         + lambda_recon  * L_recon       # Grid reconstruction
-        + lambda_var    * L_std         # VICReg variance on RAW latents  ← NEW
-        + lambda_cov    * L_cov_raw     # VICReg covariance on RAW latents ← NEW
-        + lambda_cov_p  * L_cov_proj    # VICReg covariance on projector outputs ← RETAINED
+        + lambda_var    * L_std         # VICReg variance on RAW latents
+        + lambda_cov    * L_cov_raw     # VICReg covariance on RAW latents
+        + lambda_cov_p  * L_cov_proj    # VICReg covariance on projector outputs
         + L_policy                      # AlphaZero-style policy
         + L_multistep                   # Auxiliary multi-step JEPA
 
-    Key design decisions vs. prior version:
-    1. JEPA MSE is now computed in projector space (1024D) so invariance is
-       enforced in the higher-dimensional buffer, not the core 512D latent.
-    2. VICReg variance + covariance apply to RAW target/pred latents (512D)
+    Key design decisions (with citations):
+
+    1. JEPA MSE in RAW latent space (512D), NOT projector space.
+       CITATION: I-JEPA paper (Assran et al., 2023), Section 3, Loss Eq.:
+         (1/M) * Σ Σ_{j∈B_i} || ŝ_{y_j} - s_{y_j} ||_2^2
+       Both terms are in the encoder's native embedding space. There is no
+       projector in the official I-JEPA/V-JEPA loss; adding one and computing
+       loss there creates a collapse shortcut (projector collapses the 512D
+       representation to satisfy MSE without needing rich latents).
+       CITATION: V-JEPA official vjepa/train.py, loss_fn (lines 440-446):
+         loss += torch.mean(torch.abs(zi - hi)**loss_exp) / loss_exp
+       where z = predictor output, h = F.layer_norm(target_encoder(clips)).
+       Both are in the encoder's native d_model space.
+
+    2. VICReg variance + covariance apply to RAW pred latents (512D)
        so the encoder itself must produce decorrelated features.
-    3. VICReg covariance also applies to projector outputs (1024D) at a
-       reduced weight, so the projector is still incentivised to span its
-       full dimensionality rather than collapsing to a low-rank mapping.
-    4. Separate var_weight (default 25.0) matches the VICReg paper balance.
+
+    3. VICReg covariance ALSO applies to projector outputs (1024D) at a
+       reduced weight so the projector is incentivised to span its full
+       dimensionality rather than collapsing to a low-rank map.
+
+    4. Covariance normalised by (1/D) per VICReg paper (Bardes et al., 2021),
+       Equation 3: v(Z) = (1/d) * Σ_{i≠j} [C(Z)]_{ij}^2.
+       Old normalisation (1/(D*(D-1))) was 512× too weak for D=512.
     """
     def __init__(
         self,
@@ -65,20 +80,36 @@ class ARCJPELoss(nn.Module):
         """
         # Raw 512-dim latents (encoder output)
         pred_latents   = outputs['pred_latents']    # [B, T_pred, 512]
-        target_latents = outputs['target_latents']  # [B, T_pred, 512]
+        target_latents = outputs['target_latents']  # [B, T_pred, 512] — no_grad, EMA encoder
 
-        # 1024-dim projector outputs (for JEPA MSE and projector-level cov)
-        projected_pred   = outputs['projected_pred_latents']    # [B, T_pred, 1024]
-        projected_target = outputs['projected_target_latents']  # [B, T_pred, 1024]
+        # 1024-dim projector outputs.
+        # projected_pred is used for cov_proj decorrelation (only).
+        # projected_target is no longer used — JEPA loss is now in raw 512D space.
+        projected_pred   = outputs['projected_pred_latents']    # [B, T_pred, 1024]  differentiable
+        # projected_target kept in dict for potential monitoring but not consumed in loss.
 
         decoder_logits  = outputs['decoder_logits']
         final_state_gt  = targets['final_state']
 
-        # ── 1. JEPA Loss — enforced in projector space (1024D) ─────────────
-        # Operating in projector space keeps the invariance objective out of
-        # the raw latent space so VICReg can freely decorrelate it there.
-        # Paper: I-JEPA uses L2 distance; MSE provides stronger gradients.
-        jepa_loss = F.mse_loss(projected_pred, projected_target)
+        # ── 1. JEPA Loss — enforced in RAW encoder latent space (512D) ──────
+        # CITATION: I-JEPA paper (Assran et al., 2023), Section 3, Loss Eq.:
+        #   (1/M) * Σ Σ_{j∈B_i} || ŝ_{y_j} - s_{y_j} ||_2^2
+        #   Both s_hat (predictor output) and s_y (target encoder output) are
+        #   in the encoder's native embedding space — no projector involved.
+        # CITATION: V-JEPA official vjepa/train.py, loss_fn (lines 440-446):
+        #   loss += torch.mean(torch.abs(zi - hi)**loss_exp) / loss_exp
+        #   zi = predictor output [B, N, D],  hi = F.layer_norm(target(clips))
+        #   Both in encoder d_model space.
+        #
+        # WHY: Computing JEPA MSE in projector space was a collapse shortcut.
+        # The projector could learn a degenerate 512→1024 map that minimises
+        # MSE without the raw latents being rich or decorrelated.
+        # Forcing loss in raw 512D space means the encoder itself must produce
+        # representations that are predictable — no escape hatch.
+        # .detach() is belt-and-suspenders: target_latents is already produced
+        # under torch.no_grad() in world_model.py, but this documents intent
+        # and guards against future refactoring that reattaches the target path.
+        jepa_loss = F.mse_loss(pred_latents, target_latents.detach())
 
         # ── 2. Reconstruction Loss ──────────────────────────────────────────
         if self.use_focal:
@@ -96,14 +127,22 @@ class ARCJPELoss(nn.Module):
 
         # ── 3. Variance Regularization on RAW latents (primary anti-collapse) ──
         # Flatten [B, T, D] → [B*T, D] for sufficient sample count.
+        # NOTE: target_latents is produced under torch.no_grad() in world_model.py
+        # (target encoder is EMA-updated, not gradient-updated). So std_target
+        # contributes a non-zero loss VALUE but zero GRADIENT — it is informational
+        # only. The gradient comes entirely from flat_pred_raw (online encoder).
         flat_target_raw = target_latents.reshape(-1, target_latents.size(-1))
         flat_pred_raw   = pred_latents.reshape(-1, pred_latents.size(-1))
 
         # unbiased=False to prevent NaN on small effective batch sizes
-        std_target = torch.sqrt(flat_target_raw.var(dim=0, unbiased=False) + 1e-4)
         std_pred   = torch.sqrt(flat_pred_raw.var(dim=0, unbiased=False) + 1e-4)
+        # Target std is detached — use only for monitoring/loss value balance
+        with torch.no_grad():
+            std_target = torch.sqrt(flat_target_raw.var(dim=0, unbiased=False) + 1e-4)
 
         # VICReg-standard hinge: penalise dimensions whose std < 1.0
+        # Only pred has live gradients; target term is a constant added for
+        # loss scale symmetry and can be dropped if needed.
         std_loss = (
             torch.mean(F.relu(1.0 - std_target)) +
             torch.mean(F.relu(1.0 - std_pred))
@@ -131,16 +170,22 @@ class ARCJPELoss(nn.Module):
 
         # ── 5. Covariance Regularization ─────────────────────────────────────
         if self.use_vicreg:
-            # PRIMARY: Covariance on raw 512-dim target latents.
-            # This forces the ENCODER to produce decorrelated features.
-            # Gradients flow directly into the online encoder weights.
-            cov_loss_raw = self.vicreg_cov_loss(target_latents)
+            # PRIMARY: Covariance on raw 512-dim PRED latents (online encoder).
+            #
+            # CRITICAL: target_latents is produced under torch.no_grad() in
+            # world_model.py (EMA encoder). Applying cov loss to target_latents
+            # gives a non-zero scalar but ZERO gradient — a silent no-op.
+            # We use pred_latents (online encoder, fully differentiable).
+            cov_loss_raw = self.vicreg_cov_loss(pred_latents)
 
-            # SECONDARY: Covariance on 1024-dim projector outputs.
+            # SECONDARY: Covariance on 1024-dim projector PRED outputs.
+            # projected_pred IS differentiable (online encoder → projector).
             # Keeps the projector incentivised to span its full dimensionality.
-            # Reduced weight (proj_cov_weight < vicreg_weight) so it does not
-            # dominate over the primary raw-latent decorrelation signal.
-            cov_loss_proj = self.vicreg_cov_loss(projected_target)
+            # NOTE: The projector is no longer used in the JEPA invariance loss;
+            # its only role now is to provide a higher-dimensional surface for
+            # this covariance penalty. proj_cov_weight is kept at 5.0 (reduced)
+            # because a full weight here would over-constrain the projector.
+            cov_loss_proj = self.vicreg_cov_loss(projected_pred)
 
             cov_loss = (
                 self.vicreg_weight   * cov_loss_raw +

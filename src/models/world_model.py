@@ -24,6 +24,7 @@ accelerate launch --num_processes 8 train.py \
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import copy
 from typing import Optional, Dict, Any
 
@@ -231,11 +232,23 @@ class ARCJEPAWorldModel(nn.Module):
             # Slice K-1:T-1 (grids[K...T-1]) to match pred_latents
             s_next_target = self.encode(target_grids[:, K-1:T-1], self.target_encoder)
 
+            # Normalise target representations over the feature dimension.
+            # CITATION: V-JEPA official vjepa/train.py, forward_target(), line 426:
+            #   h = F.layer_norm(h, (h.size(-1),))  # normalize over feature-dim
+            # This stabilises the target representation scale as EMA tau
+            # anneals toward 1.0 (target encoder nearly frozen) and prevents
+            # the JEPA MSE loss scale from drifting across training.
+            s_next_target = F.layer_norm(s_next_target, (s_next_target.size(-1),))
+
             # Multi-step targets
             if self.multistep_k > 1 and K - 1 + self.multistep_k <= T:
                 multistep_target_latents = self.encode(
                     target_grids[:, K-1 : K-1+self.multistep_k],
                     self.target_encoder
+                )
+                multistep_target_latents = F.layer_norm(
+                    multistep_target_latents,
+                    (multistep_target_latents.size(-1),)
                 )
             else:
                 multistep_target_latents = None
@@ -250,9 +263,21 @@ class ARCJEPAWorldModel(nn.Module):
         # Policy logits
         policy_logits = self.policy_head(pred_latents)
 
-        # VICReg Projections (compute std/cov losses in higher dimension)
+        # VICReg Projection on PRED latents only (online encoder → projector).
+        # projected_pred receives gradients from the covariance loss on
+        # projector outputs, keeping the projector's 1024D space decorrelated.
         projected_pred_latents = self.projector(pred_latents)
-        projected_target_latents = self.projector(s_next_target)
+
+        # CRITICAL: Projector target path must have NO gradients.
+        # Previously self.projector(s_next_target) was called outside no_grad,
+        # giving the projector gradient signal from the EMA-frozen target path.
+        # This trained the projector to map ANY input close to the prediction —
+        # a direct collapse shortcut. Wrapping in no_grad eliminates it.
+        # CITATION: Official I-JEPA/V-JEPA has no projector at all; the loss
+        # is computed directly in encoder space. This is the closest safe
+        # approximation when keeping the projector for the cov_proj term.
+        with torch.no_grad():
+            projected_target_latents = self.projector(s_next_target)
 
         output = {
             'pred_latents': pred_latents,

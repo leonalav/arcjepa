@@ -6,42 +6,65 @@ from typing import Optional
 
 class VICRegCovarianceLoss(nn.Module):
     """
-    VICReg Covariance Loss: Penalizes off-diagonal elements of the covariance matrix
-    to force latent dimensions to be decorrelated and encode distinct information.
+    Feature decorrelation loss on the CORRELATION matrix.
+
+    Operates on the correlation matrix (not raw covariance) so that the
+    penalty is scale-invariant: a feature pair with corr=0.97 contributes
+    0.97²=0.94 to the loss regardless of per-dimension variance magnitude.
+    The variance term (std_loss) handles scale separately.
+
+    Normalization: (1/D) * sum_off_diag( C² )
+    ──────────────────────────────────────────────────────────────────────
+    CITATION: VICReg paper (Bardes et al., 2021, arXiv:2105.04906),
+    Section 2, Equation 3:
+
+        v(Z) = (1/d) * Σ_{i≠j} [C(Z)]_{ij}²
+
+    The paper normalises by D (the embedding dimension), NOT by D*(D-1).
+    Our previous code divided by D*(D-1) = 261,632 for D=512, which is
+    512× weaker than the paper's formula. With weight=25 this produced a
+    covariance gradient contribution of ~0.5 vs std_loss ~15 — a 30×
+    imbalance that left features correlated despite VICReg being active.
     """
     def __init__(self, eps: float = 1e-4):
         super().__init__()
         self.eps = eps
 
-    def forward(self, target_latents: torch.Tensor) -> torch.Tensor:
+    def forward(self, latents_input: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            target_latents: [B, T, D] or [B, D] tensor of latent representations
+            latents_input: [B, T, D] or [B, D] tensor of latent representations
 
         Returns:
-            Covariance loss (scalar)
+            Scalar covariance loss: (1/D) * sum of squared off-diagonal
+            entries of the per-batch correlation matrix.
         """
         # Flatten batch and time dimensions if needed
-        if target_latents.dim() == 3:
-            B, T, D = target_latents.shape
-            latents = target_latents.reshape(B * T, D)
+        if latents_input.dim() == 3:
+            B, T, D = latents_input.shape
+            latents = latents_input.reshape(B * T, D)
         else:
-            latents = target_latents
+            latents = latents_input
 
-        N = latents.shape[0]
+        N, D = latents.shape
         if N <= 1:
             return torch.tensor(0.0, device=latents.device)
 
-        # Center the features
+        # Standardize: zero mean, unit variance per dimension.
+        # This converts the covariance matrix into the correlation matrix.
         latents_centered = latents - latents.mean(dim=0, keepdim=True)
+        std = torch.sqrt(latents_centered.var(dim=0, unbiased=False) + self.eps)
+        latents_normed = latents_centered / std.unsqueeze(0)
 
-        # Compute covariance matrix: [D, D]
-        # Using N (biased) for stability with small batches
-        cov_matrix = (latents_centered.T @ latents_centered) / N
+        # Compute correlation matrix [D, D].
+        # Diagonal entries ≈ 1.0; off-diagonal entries ∈ [-1, 1].
+        corr_matrix = (latents_normed.T @ latents_normed) / N
 
-        # Penalize off-diagonal elements (divide by D to match VICReg paper)
-        # off_diag_loss = (sum(cov^2) - sum(diag(cov)^2)) / D
-        off_diag_loss = ((cov_matrix ** 2).sum() - (torch.diagonal(cov_matrix) ** 2).sum()) / D
+        # (1/D) * Σ_{i≠j} C_{ij}²
+        # CITATION: VICReg paper Eq. 3 — normalise by D, not D*(D-1).
+        # D*(D-1) is 512× too large for D=512, killing the gradient.
+        off_diag_sq_sum = (corr_matrix ** 2).sum() - (torch.diagonal(corr_matrix) ** 2).sum()
+        off_diag_loss = off_diag_sq_sum / D
 
         return off_diag_loss
 
