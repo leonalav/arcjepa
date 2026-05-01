@@ -85,6 +85,7 @@ def train():
     parser.add_argument("--recon_weight", type=float, default=0.01)
     parser.add_argument("--deepspeed", action="store_true", help="Use DeepSpeed for training")
     parser.add_argument("--local_rank", type=int, default=-1, help="Local rank for distributed training")
+    parser.add_argument("--resume_checkpoint", type=str, default=None, help="Path to checkpoint .pt file to resume training from")
 
     # Research extension flags
     parser.add_argument("--use_vicreg", action="store_true", help="Enable VICReg covariance loss")
@@ -276,6 +277,47 @@ def train():
     # and gradually stabilises as training converges.
     ema_updater = EMAUpdater(online_enc, target_enc, tau_start=0.996, tau_end=1.0)
 
+    # ── CHECKPOINT CONTINUATION MECHANISM ─────────────────────────────────────
+    start_epoch = 0
+    if args.resume_checkpoint and os.path.exists(args.resume_checkpoint):
+        if is_main_process:
+            print(f"Loading checkpoint from {args.resume_checkpoint}...")
+            
+        # Load entirely into CPU RAM first to avoid XLA memory fragmentation
+        checkpoint = torch.load(args.resume_checkpoint, map_location='cpu')
+
+        # Handle legacy checkpoints (which were just pure state_dicts) gracefully
+        if 'model_state_dict' not in checkpoint:
+            state_dict = checkpoint
+            opt_dict = None
+            ckpt_epoch = 0
+            if is_main_process:
+                print("Legacy checkpoint detected. Restoring weights without optimizer states.")
+        else:
+            state_dict = checkpoint['model_state_dict']
+            opt_dict = checkpoint.get('optimizer_state_dict', None)
+            ckpt_epoch = checkpoint.get('epoch', 0)
+
+        # Strip module prefixes if saved via DDP
+        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+
+        # Load Model Weights
+        if IS_TPU:
+            unwrapped = accelerator.unwrap_model(model)
+            unwrapped.load_state_dict(state_dict)
+        else:
+            unwrapped = model.module if hasattr(model, 'module') else model
+            unwrapped.load_state_dict(state_dict)
+
+        # Load Optimizer State
+        if opt_dict is not None and not args.deepspeed:
+            optimizer.load_state_dict(opt_dict)
+            
+        start_epoch = ckpt_epoch
+        if is_main_process:
+            print(f"Successfully resumed. Starting from Epoch {start_epoch + 1}")
+    # ──────────────────────────────────────────────────────────────────────────
+
     # Initialize logger
     logger = None
     if is_main_process:
@@ -320,7 +362,7 @@ def train():
     # CSV logging setup
     csv_metrics = []
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         if sampler: sampler.set_epoch(epoch)
         total_loss = 0
 
@@ -469,12 +511,20 @@ def train():
             # Save Checkpoint
             save_path = Path(args.output_dir)
             save_path.mkdir(exist_ok=True)
+            
+            # Create a full checkpoint dictionary
+            checkpoint_dict = {
+                'epoch': epoch + 1,
+                'optimizer_state_dict': optimizer.state_dict()
+            }
+            
             if IS_TPU:
                 unwrapped_model = accelerator.unwrap_model(model)
-                torch.save(unwrapped_model.state_dict(), save_path / f"world_model_epoch_{epoch+1}.pt")
+                checkpoint_dict['model_state_dict'] = unwrapped_model.state_dict()
             else:
-                state_to_save = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
-                torch.save(state_to_save, save_path / f"world_model_epoch_{epoch+1}.pt")
+                checkpoint_dict['model_state_dict'] = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+                
+            torch.save(checkpoint_dict, save_path / f"world_model_epoch_{epoch+1}.pt")
 
             # Save CSV metrics for this epoch
             if args.logger == "csv" and csv_metrics:
