@@ -20,11 +20,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import copy
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, NamedTuple, Tuple
 
 from .embeddings import GridEmbedding, ActionEmbedding, PositionalEncoding2D
 from .spatial_encoder import DiscreteViT
-from .sequence_model import GDNSequenceModel
+from .sequence_model import GDNSequenceModel, GDNState
 from .jepa_predictor import JEPAPredictor
 from .decoder import GridDecoder
 
@@ -273,3 +273,106 @@ class ARCJEPAWorldModel(nn.Module):
             output['multistep_target_latents'] = multistep_target_latents
 
         return output
+
+    # ───────────────────────────────────────────────────────────────────────
+    # O(1) INFERENCE METHODS FOR MCTS
+    # ───────────────────────────────────────────────────────────────────────
+    # To use in MCTS:
+    # 1. state = model.init_inference(context_grids)
+    # 2. next_state, policy, value = model.inference_step(state, action, cx, cy)
+    # memory remains strictly O(1) regardless of depth.
+
+    def init_inference(
+        self, 
+        context_grids: torch.Tensor,
+    ) -> 'InferenceState':
+        """
+        Initialize O(1) inference state from context frames.
+        
+        Args:
+            context_grids: [B, K, 64, 64] — prior state history
+            
+        Returns:
+            InferenceState with fixed-size memory footprint
+        """
+        # 1. Encode context
+        ctx_latents = self.encode(context_grids, self.online_encoder)  # [B, K, d_model]
+        
+        # 2. Process through GDN to build recurrent state
+        # We pass use_cache=True to get the final GDN state S
+        _, gdn_state = self.gdn(ctx_latents, use_cache=True)
+        
+        # 3. Initial inference state uses the last encoded frame
+        return InferenceState(
+            latent=ctx_latents[:, -1],  # [B, d_model]
+            gdn_state=gdn_state,
+            step_idx=0
+        )
+
+    def inference_step(
+        self,
+        state: 'InferenceState',
+        action: torch.Tensor,       # [B]
+        coord_x: torch.Tensor,      # [B]
+        coord_y: torch.Tensor,      # [B]
+    ) -> Tuple['InferenceState', Dict[str, torch.Tensor]]:
+        """
+        Single step MCTS rollout. Strictly O(1) memory and time.
+        
+        Args:
+            state: Prior InferenceState
+            action, coord_x, coord_y: Proposed move
+            
+        Returns:
+            next_state: Updated InferenceState
+            outputs: Dict with 'policy_logits' and 'decoder_logits'
+        """
+        # 1. Get action embedding
+        z_a = self.action_embed(
+            action.unsqueeze(1), 
+            coord_x.unsqueeze(1), 
+            coord_y.unsqueeze(1)
+        ).squeeze(1)  # [B, d_model]
+        
+        # 2. Update GDN state with current latent
+        # O(1) rank-1 update to recurrent state S
+        gdn_summary, next_gdn_state = self.gdn.step(
+            state.latent.unsqueeze(1),  # [B, 1, d_model]
+            state.gdn_state
+        )
+        gdn_summary = gdn_summary.squeeze(1)  # [B, d_model]
+        
+        # 3. Predict next latent using O(1) predictor
+        # Uses 3 tokens: [latent, gdn_summary, action_mask]
+        next_latent = self.predictor.forward_step(
+            s_t=state.latent,
+            action_embed=z_a,
+            gdn_state_summary=gdn_summary,
+            step_idx=state.step_idx
+        )  # [B, d_model]
+        
+        # 4. Generate auxiliary outputs for MCTS (policy prior, value/reconstruction)
+        policy_logits = self.policy_head(next_latent.unsqueeze(1)).squeeze(1)
+        decoder_logits = self.decoder(next_latent)
+        
+        # 5. Pack next state
+        next_state = InferenceState(
+            latent=next_latent,
+            gdn_state=next_gdn_state,
+            step_idx=state.step_idx + 1
+        )
+        
+        outputs = {
+            'policy_logits': policy_logits,
+            'decoder_logits': decoder_logits,
+            'pred_latent': next_latent
+        }
+        
+        return next_state, outputs
+
+class InferenceState(NamedTuple):
+    """O(1) memory state for MCTS rollouts."""
+    latent: torch.Tensor           # [B, d_model] — current state
+    gdn_state: GDNState            # Fixed-size recurrent state S ∈ ℝ^{HV×K×V}
+    step_idx: int                  # For positional encoding
+

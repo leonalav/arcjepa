@@ -217,6 +217,63 @@ class JEPAPredictor(nn.Module):
 
         return x
 
+    def forward_step(
+        self,
+        s_t: torch.Tensor,
+        action_embed: torch.Tensor,
+        gdn_state_summary: torch.Tensor,
+        step_idx: int = 0
+    ) -> torch.Tensor:
+        """
+        O(1) MEMORY single-step prediction for MCTS rollouts.
+
+        Instead of self-attention over a growing context (O(N) memory),
+        this method uses a fixed-size GDN state summary as context.
+        The GDN recurrent state S ∈ ℝ^{HV×K×V} compresses the entire
+        history into a fixed-size matrix, which we project into a small
+        number of "summary tokens" that serve as the predictor's context.
+
+        Memory per call: O(1) — no sequence buffers, no KV-cache growth.
+
+        Args:
+            s_t: [B, d_model] — current state latent (single step)
+            action_embed: [B, d_model] — action embedding for this step
+            gdn_state_summary: [B, d_model] — GDN output for current step
+                (from GDNSequenceModel.step())
+            step_idx: temporal position index for positional encoding
+
+        Returns:
+            pred_latent: [B, d_model] — predicted next-state latent
+        """
+        B = s_t.shape[0]
+
+        # Create fixed-size context: [current_state, gdn_summary] = 2 tokens
+        ctx_tokens = torch.stack([s_t, gdn_state_summary], dim=1)  # [B, 2, d_model]
+        ctx = self.predictor_embed(ctx_tokens)  # [B, 2, pred_dim]
+
+        # Create single action-conditioned mask token
+        act = self.action_proj(action_embed.unsqueeze(1))  # [B, 1, pred_dim]
+        pred_token = self.mask_token.expand(B, 1, -1) + act  # [B, 1, pred_dim]
+
+        # Add positional encoding (based on step_idx)
+        ctx = ctx + self.predictor_pos_embed[:, :2, :]
+        pred_token = pred_token + self.predictor_pos_embed[:, 2 + step_idx:3 + step_idx, :]
+
+        # Concatenate: [2 context tokens, 1 prediction token] = 3 tokens total
+        x = torch.cat([ctx, pred_token], dim=1)  # [B, 3, pred_dim]
+
+        # Self-attention over 3 tokens — O(1) cost
+        for blk in self.predictor_blocks:
+            x = blk(x)
+
+        x = self.predictor_norm(x)
+
+        # Extract prediction token (last position)
+        x = x[:, -1:]  # [B, 1, pred_dim]
+        x = self.predictor_proj(x).squeeze(1)  # [B, d_model]
+
+        return x
+
     def forward_multistep(
         self,
         s_t: torch.Tensor,
@@ -224,11 +281,14 @@ class JEPAPredictor(nn.Module):
         k: int
     ) -> torch.Tensor:
         """
-        Multi-step autoregressive rollout for auxiliary loss.
+        Multi-step autoregressive rollout for auxiliary loss (training).
 
         Uses autoregressive chaining: predict step t+1, feed back as context
         for step t+2, etc. This tests the predictor's ability to chain
         predictions without error accumulation.
+
+        NOTE: This method uses the full ``forward()`` with growing context.
+        For O(1) inference (MCTS), use ``forward_step()`` instead.
 
         Args:
             s_t: Initial state [B, d_model] — single time-step

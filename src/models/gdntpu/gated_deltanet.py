@@ -188,7 +188,11 @@ class GatedDeltaNet(nn.Module):
             hidden_states : ``[B, T, hidden_size]``
 
         Returns:
-            ``(output, None, None)`` — matching FLA's return signature.
+            ``(output, None, state_or_None)`` — matching FLA's return signature.
+            When ``use_cache=True``, the third element is the GDN recurrent
+            state ``S`` of shape ``[B, HV, K, V]`` — a fixed-size matrix that
+            compresses the entire history.  This enables O(1) inference per
+            step regardless of sequence length.
         """
         batch_size, q_len, _ = hidden_states.shape
 
@@ -232,8 +236,11 @@ class GatedDeltaNet(nn.Module):
         scale = self.head_k_dim ** -0.5
 
         # ---- Run delta rule (kernel dispatch) ---------------------------
+        output_final_state = bool(use_cache)
+        initial_state = past_key_values  # [B, HV, K, V] or None
+
         if mode == "chunk":
-            o, _ = pure_chunk_gated_delta_rule(
+            o, final_state = pure_chunk_gated_delta_rule(
                 q=q,
                 k=k,
                 v=v,
@@ -241,19 +248,19 @@ class GatedDeltaNet(nn.Module):
                 beta=beta,
                 scale=scale,
                 chunk_size=64,
-                initial_state=None,
-                output_final_state=False,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
             )
         else:  # fused_recurrent
-            o, _ = pure_recurrent_gated_delta_rule(
+            o, final_state = pure_recurrent_gated_delta_rule(
                 q=q,
                 k=k,
                 v=v,
                 g=g_log,
                 beta=beta,
                 scale=scale,
-                initial_state=None,
-                output_final_state=False,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
             )
         # o: [B, T, HV, V]
 
@@ -270,4 +277,4 @@ class GatedDeltaNet(nn.Module):
         o = rearrange(o, "b t h d -> b t (h d)")   # [B, T, value_dim]
         o = self.o_proj(o)                           # [B, T, hidden_size]
 
-        return o, None, past_key_values
+        return o, None, final_state

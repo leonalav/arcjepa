@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple
+from typing import Optional, Tuple, NamedTuple
 
 # --- Backend selection -------------------------------------------------------
 # Priority:
@@ -20,6 +20,17 @@ except ImportError:
     HAS_FLA = False
 
 
+class GDNState(NamedTuple):
+    """Fixed-size recurrent state for O(1) inference.
+
+    Memory footprint: B × HV × K × V × sizeof(float32)
+    With default dims (HV=8, K=64, V=128): 8×64×128×4 = 256 KB per sample.
+    This is INDEPENDENT of sequence length — the entire history is compressed
+    into this fixed-size matrix via the delta rule's associative updates.
+    """
+    gdn_state: torch.Tensor  # [B, HV, K, V] — GDN recurrent state
+
+
 class GDNSequenceModel(nn.Module):
     """Sequence model using Gated Delta Network wrapped in a proper
     Transformer block.
@@ -35,6 +46,13 @@ class GDNSequenceModel(nn.Module):
     - Pre-normalization for training stability
     - Feed-forward network for per-token feature transformation
     - GDN remains O(N) linear complexity (satisfies user constraint)
+
+    Inference complexity guarantees:
+    - ``forward()``: O(N) time, O(N) memory — processes full sequence
+    - ``step()``:    O(1) time, O(1) memory — single-token recurrent step
+      The recurrent state S ∈ ℝ^{H×K×V} is a fixed-size matrix that
+      compresses the entire history via the delta rule's associative updates.
+      MCTS rollouts use ``step()`` for O(1) per move.
 
     On TPU/CPU: uses the pure-PyTorch ``gdntpu.GatedDeltaNet`` (XLA-safe).
     On CUDA (with fla installed): uses ``fla.layers.GatedDeltaNet`` (Triton).
@@ -52,6 +70,7 @@ class GDNSequenceModel(nn.Module):
         **kwargs,
     ):
         super().__init__()
+        self.d_model = d_model
 
         is_cuda = torch.cuda.is_available()
 
@@ -92,30 +111,86 @@ class GDNSequenceModel(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        state: Optional[torch.Tensor] = None,
+        state: Optional[GDNState] = None,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[GDNState]]:
         """
+        Full-sequence forward pass. O(N) time, O(N) memory.
+
+        Used during:
+        - Training (teacher forcing)
+        - Initial context processing before MCTS rollout
+
         Args:
             x         : ``[B, T, d_model]``
-            state     : Optional recurrent state for inference.
-            use_cache : Whether to return the final recurrent state.
+            state     : Optional prior ``GDNState`` (for continuation).
+            use_cache : If True, return the final recurrent state for
+                        subsequent ``step()`` calls.
 
         Returns:
-            ``(output [B, T, d_model], next_state or None)``
+            ``(output [B, T, d_model], GDNState or None)``
         """
+        gdn_state = state.gdn_state if state is not None else None
+
         # ── Sublayer 1: Pre-Norm + GDN + Residual ─────────────────────────
         normed = self.norm1(x)
-        res = self.gdn(normed, past_key_values=state, use_cache=use_cache)
+        res = self.gdn(normed, past_key_values=gdn_state, use_cache=use_cache)
         if isinstance(res, (tuple, list)):
             gdn_out = res[0]
-            next_state = res[2] if len(res) > 2 else None
+            next_gdn_state = res[2] if len(res) > 2 else None
         else:
             gdn_out = res
-            next_state = None
+            next_gdn_state = None
         x = x + gdn_out
 
         # ── Sublayer 2: Pre-Norm + FFN + Residual ─────────────────────────
         x = x + self.ffn(self.norm2(x))
 
+        next_state = GDNState(gdn_state=next_gdn_state) if next_gdn_state is not None else None
         return x, next_state
+
+    def step(
+        self,
+        x_t: torch.Tensor,
+        state: GDNState,
+    ) -> Tuple[torch.Tensor, GDNState]:
+        """
+        Single-token recurrent step. **O(1) time, O(1) memory.**
+
+        This is the method MCTS rollouts should call. The recurrent state
+        ``S ∈ ℝ^{B × HV × K × V}`` is a fixed-size matrix — its size is
+        independent of how many prior tokens have been processed.
+
+        Mathematical guarantee (GDN paper, Eq. 10):
+            S_t = α_t (I − β_t k_t k_t^T) S_{t-1} + β_t v_t k_t^T
+            o_t = S_t q_t
+        Each step applies a rank-1 update to S: O(K×V) = O(1) per step.
+
+        Args:
+            x_t   : ``[B, 1, d_model]`` — single input token.
+            state : ``GDNState`` from prior ``forward()`` or ``step()`` call.
+
+        Returns:
+            ``(output [B, 1, d_model], next_state: GDNState)``
+        """
+        # ── Sublayer 1: Pre-Norm + GDN (recurrent, T=1) + Residual ────────
+        normed = self.norm1(x_t)
+        # GDN with T=1 → recurrent mode → single step, O(1) memory
+        res = self.gdn(
+            normed,
+            past_key_values=state.gdn_state,
+            use_cache=True  # always output final state for next step
+        )
+        if isinstance(res, (tuple, list)):
+            gdn_out = res[0]
+            next_gdn_state = res[2] if len(res) > 2 else state.gdn_state
+        else:
+            gdn_out = res
+            next_gdn_state = state.gdn_state
+
+        x_t = x_t + gdn_out
+
+        # ── Sublayer 2: Pre-Norm + FFN + Residual ─────────────────────────
+        x_t = x_t + self.ffn(self.norm2(x_t))
+
+        return x_t, GDNState(gdn_state=next_gdn_state)
