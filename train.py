@@ -292,6 +292,7 @@ def train():
     # I-JEPA paper: start tau=0.996, linearly anneal to 1.0 throughout training.
     ema_updater = EMAUpdater(online_enc, target_enc, tau_start=0.996, tau_end=1.0)
 
+<<<<<<< HEAD
     # ── Cosine LR Schedule with Warmup (E1 fix) ──────────────────────────────
     # CITATION: V-JEPA uses warmup + cosine decay.
     total_steps = args.epochs * len(dataloader)
@@ -317,21 +318,39 @@ def train():
 
         checkpoint = torch.load(args.resume_checkpoint, map_location='cpu')
 
+=======
+    # ── CHECKPOINT CONTINUATION MECHANISM ─────────────────────────────────────
+    start_epoch = 0
+    if args.resume_checkpoint and os.path.exists(args.resume_checkpoint):
+        if is_main_process:
+            print(f"Loading checkpoint from {args.resume_checkpoint}...")
+            
+        # Load entirely into CPU RAM first to avoid XLA memory fragmentation
+        checkpoint = torch.load(args.resume_checkpoint, map_location='cpu')
+
+        # Handle legacy checkpoints (which were just pure state_dicts) gracefully
+>>>>>>> 0967acae9b73b76b5f103e54e4374e1ebbff86c9
         if 'model_state_dict' not in checkpoint:
             state_dict = checkpoint
             opt_dict = None
             ckpt_epoch = 0
+<<<<<<< HEAD
             import re
             match = re.search(r'epoch_(\d+)', args.resume_checkpoint)
             if match:
                 ckpt_epoch = int(match.group(1))
             if is_main_process:
                 print(f"Legacy checkpoint detected. Restoring weights without optimizer states (extracted epoch {ckpt_epoch} from filename).")
+=======
+            if is_main_process:
+                print("Legacy checkpoint detected. Restoring weights without optimizer states.")
+>>>>>>> 0967acae9b73b76b5f103e54e4374e1ebbff86c9
         else:
             state_dict = checkpoint['model_state_dict']
             opt_dict = checkpoint.get('optimizer_state_dict', None)
             ckpt_epoch = checkpoint.get('epoch', 0)
 
+<<<<<<< HEAD
         state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
 
         if IS_TPU:
@@ -355,6 +374,24 @@ def train():
         for _ in range(global_step):
             scheduler.step()
 
+=======
+        # Strip module prefixes if saved via DDP
+        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+
+        # Load Model Weights
+        if IS_TPU:
+            unwrapped = accelerator.unwrap_model(model)
+            unwrapped.load_state_dict(state_dict)
+        else:
+            unwrapped = model.module if hasattr(model, 'module') else model
+            unwrapped.load_state_dict(state_dict)
+
+        # Load Optimizer State
+        if opt_dict is not None and not args.deepspeed:
+            optimizer.load_state_dict(opt_dict)
+            
+        start_epoch = ckpt_epoch
+>>>>>>> 0967acae9b73b76b5f103e54e4374e1ebbff86c9
         if is_main_process:
             print(f"Successfully resumed. Starting from Epoch {start_epoch + 1}")
     # ──────────────────────────────────────────────────────────────────────────
@@ -543,6 +580,7 @@ def train():
 
             save_path = Path(args.output_dir)
             save_path.mkdir(exist_ok=True)
+<<<<<<< HEAD
 
             checkpoint_dict = {
                 'epoch': epoch + 1,
@@ -550,12 +588,25 @@ def train():
                 'optimizer_state_dict': optimizer.state_dict()
             }
 
+=======
+            
+            # Create a full checkpoint dictionary
+            checkpoint_dict = {
+                'epoch': epoch + 1,
+                'optimizer_state_dict': optimizer.state_dict()
+            }
+            
+>>>>>>> 0967acae9b73b76b5f103e54e4374e1ebbff86c9
             if IS_TPU:
                 unwrapped_model = accelerator.unwrap_model(model)
                 checkpoint_dict['model_state_dict'] = unwrapped_model.state_dict()
             else:
                 checkpoint_dict['model_state_dict'] = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+<<<<<<< HEAD
 
+=======
+                
+>>>>>>> 0967acae9b73b76b5f103e54e4374e1ebbff86c9
             torch.save(checkpoint_dict, save_path / f"world_model_epoch_{epoch+1}.pt")
 
             if args.logger == "csv" and csv_metrics:
