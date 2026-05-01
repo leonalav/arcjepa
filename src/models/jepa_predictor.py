@@ -1,128 +1,256 @@
+"""
+V-JEPA-faithful Transformer Predictor for ARC-JEPA.
+
+CITATION: V-JEPA official predictor.py (VisionTransformerPredictor).
+Architecture:
+  1. predictor_embed: Linear(d_model → predictor_embed_dim) — projects
+     context and creates action-conditioned mask tokens
+  2. Learnable mask tokens for target positions
+  3. Sinusoidal temporal positional encoding (frozen)
+  4. depth × Transformer blocks with self-attention
+  5. predictor_norm + predictor_proj back to d_model
+
+Adaptation from V-JEPA:
+  - V-JEPA uses spatial mask tokens for hidden patches; we use temporal
+    mask tokens for future time steps, conditioned on action embeddings
+  - V-JEPA uses 2D sincos spatial positional encoding; we use 1D sincos
+    temporal positional encoding
+  - Context = GDN-processed temporal features; Targets = future state
+    predictions conditioned by actions
+"""
+
+import math
+import numpy as np
+
 import torch
 import torch.nn as nn
-from typing import Optional
+
+
+def _get_1d_sincos_pos_embed(embed_dim: int, length: int) -> np.ndarray:
+    """Generate 1D sinusoidal positional embeddings.
+
+    Returns: [length, embed_dim] numpy array.
+    """
+    positions = np.arange(length, dtype=np.float64)
+    dim = embed_dim // 2
+    omega = np.arange(dim, dtype=np.float64) / dim
+    omega = 1.0 / (10000.0 ** omega)
+    out = np.outer(positions, omega)  # [length, dim]
+    emb = np.concatenate([np.sin(out), np.cos(out)], axis=1)  # [length, embed_dim]
+    if embed_dim % 2 == 1:
+        # Pad with a zero column for odd embed_dim
+        emb = np.concatenate([emb, np.zeros((length, 1))], axis=1)
+    return emb
+
 
 class JEPAPredictor(nn.Module):
     """
-    Memory-efficient JEPA Predictor with bottleneck architecture.
+    V-JEPA-faithful Transformer Predictor adapted for ARC World Model.
 
-    Key design from I-JEPA paper (Table 14):
-    - Bottleneck width (384) improves performance vs full width (1024)
-    - Lightweight MLP with depth for capacity
-    - NO residual connection to force learning
-    - Concatenate state+action to preserve information
+    During training, context tokens (GDN-processed latents) and
+    action-conditioned mask tokens for all future steps are concatenated
+    and processed through self-attention blocks. The predictor outputs
+    predictions for all target positions in parallel.
 
-    Memory: ~5M params (vs ~30M Transformer, ~40M multi-GDN)
+    CITATION: V-JEPA predictor.py, lines 23-239.
+
+    Args:
+        d_model: Encoder embedding dimension (512).
+        predictor_embed_dim: Internal predictor dimension (384).
+            CITATION: I-JEPA Table 14 — bottleneck width 384 outperforms
+            full width for predictor.
+        depth: Number of Transformer blocks (6).
+        num_heads: Attention heads (12).
+        mlp_ratio: FFN hidden dim = predictor_embed_dim * mlp_ratio.
+        max_seq_len: Maximum total sequence length (context + targets).
+        init_std: Weight initialization std (0.02, matching V-JEPA).
     """
     def __init__(
         self,
-        d_model: int,
-        num_layers: int = 6,
-        num_heads: int = 8,
-        bottleneck_dim: int = 384,
+        d_model: int = 512,
+        num_layers: int = 6,          # kept for API compat, mapped to depth
+        num_heads: int = 12,
+        bottleneck_dim: int = 384,    # kept for API compat, mapped to predictor_embed_dim
         dropout: float = 0.1,
-        max_seq_len: int = 100
+        max_seq_len: int = 128,       # context + targets
+        mlp_ratio: float = 4.0,
+        init_std: float = 0.02
     ):
         super().__init__()
         self.d_model = d_model
-        self.bottleneck_dim = bottleneck_dim
+        predictor_embed_dim = bottleneck_dim  # use bottleneck_dim as predictor dim
+        self.predictor_embed_dim = predictor_embed_dim
+        depth = num_layers
 
-        # Input projection: concatenate state + action, then bottleneck
-        self.input_proj = nn.Sequential(
-            nn.Linear(d_model * 2, bottleneck_dim),
-            nn.LayerNorm(bottleneck_dim)
+        # ── Projection: encoder space → predictor space ────────────────────
+        # CITATION: V-JEPA predictor.py line 50
+        self.predictor_embed = nn.Linear(d_model, predictor_embed_dim, bias=True)
+
+        # ── Action projection to predictor space ───────────────────────────
+        self.action_proj = nn.Linear(d_model, predictor_embed_dim, bias=True)
+
+        # ── Learnable mask token ───────────────────────────────────────────
+        # CITATION: V-JEPA predictor.py lines 53-59
+        # Zero-initialized as in V-JEPA (zero_init_mask_tokens=True default)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, predictor_embed_dim))
+
+        # ── Temporal positional encoding (frozen sinusoidal) ───────────────
+        # CITATION: V-JEPA predictor.py lines 87-89 (requires_grad=False)
+        self.predictor_pos_embed = nn.Parameter(
+            torch.zeros(1, max_seq_len, predictor_embed_dim),
+            requires_grad=False
+        )
+        # Initialize with sinusoidal encoding
+        sincos = _get_1d_sincos_pos_embed(predictor_embed_dim, max_seq_len)
+        self.predictor_pos_embed.data.copy_(
+            torch.from_numpy(sincos).float().unsqueeze(0)
         )
 
-        # Learnable positional encoding
-        self.pos_embed = nn.Parameter(torch.zeros(1, max_seq_len, bottleneck_dim))
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        # ── Transformer blocks ─────────────────────────────────────────────
+        # CITATION: V-JEPA predictor.py lines 92-105
+        self.predictor_blocks = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=predictor_embed_dim,
+                nhead=num_heads,
+                dim_feedforward=int(predictor_embed_dim * mlp_ratio),
+                dropout=dropout,
+                batch_first=True,
+                activation='gelu',
+                norm_first=True  # Pre-norm for training stability
+            )
+            for _ in range(depth)
+        ])
 
-        # Deep MLP with bottleneck (paper-faithful)
-        layers = []
-        for i in range(num_layers):
-            layers.extend([
-                nn.Linear(bottleneck_dim, bottleneck_dim * 2),
-                nn.LayerNorm(bottleneck_dim * 2),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(bottleneck_dim * 2, bottleneck_dim),
-                nn.LayerNorm(bottleneck_dim)
-            ])
-        self.mlp_layers = nn.Sequential(*layers)
+        # ── Output: norm + project back to encoder space ───────────────────
+        # CITATION: V-JEPA predictor.py lines 108-109
+        self.predictor_norm = nn.LayerNorm(predictor_embed_dim)
+        self.predictor_proj = nn.Linear(predictor_embed_dim, d_model, bias=True)
 
-        # Output projection back to d_model (NO RESIDUAL CONNECTION)
-        self.output_proj = nn.Sequential(
-            nn.Linear(bottleneck_dim, d_model),
-            nn.LayerNorm(d_model)
-        )
+        # ── Weight initialization ──────────────────────────────────────────
+        self.init_std = init_std
+        self.apply(self._init_weights)
+        self._rescale_blocks()
+
+    def _init_weights(self, m):
+        """CITATION: V-JEPA predictor.py lines 137-144."""
+        if isinstance(m, nn.Linear):
+            nn.init.trunc_normal_(m.weight, std=self.init_std)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def _rescale_blocks(self):
+        """Scale down residual branch weights by 1/sqrt(2*layer_id).
+
+        CITATION: V-JEPA predictor.py lines 146-152. Prevents gradient
+        explosion at initialization in deep Transformer stacks.
+        """
+        for layer_id, layer in enumerate(self.predictor_blocks):
+            # nn.TransformerEncoderLayer stores self_attn and linear2
+            if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'out_proj'):
+                layer.self_attn.out_proj.weight.data.div_(
+                    math.sqrt(2.0 * (layer_id + 1))
+                )
+            if hasattr(layer, 'linear2'):
+                layer.linear2.weight.data.div_(
+                    math.sqrt(2.0 * (layer_id + 1))
+                )
 
     def forward(
         self,
-        s_t: torch.Tensor,
-        z_a: torch.Tensor,
+        context_features: torch.Tensor,
+        action_embeds: torch.Tensor,
         step_idx: int = 0
     ) -> torch.Tensor:
         """
-        Predict s_{t+1} from s_t and action z_a.
+        Predict future latent states given GDN-processed context and actions.
+
+        This follows V-JEPA's approach: concatenate context tokens with
+        action-conditioned mask tokens, process through self-attention, and
+        extract predictions for target positions.
 
         Args:
-            s_t: Current state latent [B, T, d_model]
-            z_a: Action embedding [B, T, d_model]
-            step_idx: Position in sequence for positional encoding
+            context_features: [B, K, d_model] — GDN-processed context latents
+            action_embeds: [B, T_pred, d_model] — action embeddings for each
+                prediction step
+            step_idx: unused (kept for API compatibility)
 
         Returns:
-            s_next: Predicted next state [B, T, d_model]
+            pred_latents: [B, T_pred, d_model] — predicted next-state latents
         """
-        B, T, D = s_t.shape
+        B, K, _ = context_features.shape
+        T_pred = action_embeds.shape[1]
 
-        # Concatenate state and action (preserve both)
-        x = torch.cat([s_t, z_a], dim=-1)  # [B, T, 2*d_model]
-        x = self.input_proj(x)              # [B, T, bottleneck_dim]
+        # ── 1. Project context to predictor dim ────────────────────────────
+        ctx = self.predictor_embed(context_features)  # [B, K, pred_dim]
 
-        # Add positional encoding
-        pos = self.pos_embed[:, step_idx:step_idx+T, :]
-        x = x + pos
+        # ── 2. Create action-conditioned mask tokens ───────────────────────
+        # Each future step gets a learnable mask token + its action embedding
+        act = self.action_proj(action_embeds)  # [B, T_pred, pred_dim]
+        pred_tokens = self.mask_token.expand(B, T_pred, -1) + act
 
-        # Deep MLP with bottleneck (paper-faithful)
-        x = self.mlp_layers(x)
+        # ── 3. Add temporal positional encoding ────────────────────────────
+        total_len = K + T_pred
+        ctx = ctx + self.predictor_pos_embed[:, :K, :]
+        pred_tokens = pred_tokens + self.predictor_pos_embed[:, K:total_len, :]
 
-        # Output projection (NO residual from input - force learning)
-        s_next = self.output_proj(x)
+        # ── 4. Concatenate context + prediction tokens ─────────────────────
+        # CITATION: V-JEPA predictor.py line 221
+        x = torch.cat([ctx, pred_tokens], dim=1)  # [B, K + T_pred, pred_dim]
 
-        return s_next
+        # ── 5. Self-attention over full sequence ───────────────────────────
+        # CITATION: V-JEPA predictor.py lines 231-232
+        for blk in self.predictor_blocks:
+            x = blk(x)
+
+        # ── 6. Normalize and project back ──────────────────────────────────
+        # CITATION: V-JEPA predictor.py lines 233, 237
+        x = self.predictor_norm(x)
+
+        # Extract only prediction tokens (skip context)
+        x = x[:, K:]  # [B, T_pred, pred_dim]
+
+        # Project back to encoder space
+        x = self.predictor_proj(x)  # [B, T_pred, d_model]
+
+        return x
 
     def forward_multistep(
         self,
-        s_t: torch.Tensor,          # [B, d_model]
-        action_embeds: torch.Tensor, # [B, k, d_model]
+        s_t: torch.Tensor,
+        action_embeds: torch.Tensor,
         k: int
     ) -> torch.Tensor:
         """
-        Multi-step rollout for auxiliary loss.
-        Predicts k steps into future without intermediate supervision.
+        Multi-step autoregressive rollout for auxiliary loss.
+
+        Uses autoregressive chaining: predict step t+1, feed back as context
+        for step t+2, etc. This tests the predictor's ability to chain
+        predictions without error accumulation.
 
         Args:
-            s_t: Initial state [B, d_model]
-            action_embeds: Action embeddings for k steps [B, k, d_model]
+            s_t: Initial state [B, d_model] — single time-step
+            action_embeds: [B, k, d_model] — action embeddings for k steps
             k: Number of steps to predict
 
         Returns:
-            predictions: [B, k, d_model] predicted latents at [t+1, t+2, ..., t+k]
+            predictions: [B, k, d_model] predicted latents
         """
         predictions = []
-        s_curr = s_t  # [B, d_model]
+        # Start with a single context token
+        context = s_t.unsqueeze(1)  # [B, 1, d_model]
 
         for i in range(k):
-            z_a = action_embeds[:, i, :]  # [B, d_model]
+            z_a = action_embeds[:, i:i+1, :]  # [B, 1, d_model]
 
-            # Single-step prediction
-            s_curr_exp = s_curr.unsqueeze(1)  # [B, 1, d_model]
-            z_a_exp = z_a.unsqueeze(1)        # [B, 1, d_model]
+            # Predict single next step
+            s_next = self.forward(context, z_a, step_idx=i)  # [B, 1, d_model]
 
-            s_next = self.forward(s_curr_exp, z_a_exp, step_idx=i)
-            s_next = s_next.squeeze(1)  # [B, d_model]
+            predictions.append(s_next.squeeze(1))
 
-            predictions.append(s_next)
-            s_curr = s_next  # Autoregressive
+            # Append prediction to context for next step
+            context = torch.cat([context, s_next], dim=1)  # [B, i+2, d_model]
 
         return torch.stack(predictions, dim=1)  # [B, k, d_model]

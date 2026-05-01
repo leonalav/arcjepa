@@ -1,4 +1,10 @@
 import os
+import warnings
+# Silence specific TPU and XLA related warnings
+warnings.filterwarnings("ignore", message=".*`tensorflow` can conflict with `torch-xla`.*")
+warnings.filterwarnings("ignore", message=".*Transparent hugepages are not enabled.*")
+
+import math
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, DistributedSampler
@@ -8,7 +14,6 @@ import torch.distributed as dist
 from pathlib import Path
 import argparse
 import sys
-
 try:
     import torch_xla
     import torch_xla.core.xla_model as xm
@@ -42,21 +47,18 @@ from src.training.metrics import (
 def setup_dist(local_rank_arg=-1):
     """Dynamically setup distributed environment."""
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        # Multi-node / Multi-GPU (torchrun / deepspeed)
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
-        # DeepSpeed launcher passes --local_rank, torchrun sets LOCAL_RANK env
         if local_rank_arg != -1:
             local_rank = local_rank_arg
         else:
             local_rank = int(os.environ.get("LOCAL_RANK", 0))
-            
+
         if not dist.is_initialized():
             dist.init_process_group("nccl")
         torch.cuda.set_device(local_rank)
         return rank, world_size, local_rank
     else:
-        # Single GPU / CPU
         return 0, 1, 0
 
 def check_training_files_exist(data_path: Path) -> bool:
@@ -70,11 +72,41 @@ def check_training_files_exist(data_path: Path) -> bool:
     except StopIteration:
         return False
 
+
+def _build_param_groups(model, weight_decay: float = 0.05):
+    """Separate parameters into weight-decay and no-weight-decay groups.
+
+    Follows V-JEPA convention: bias, LayerNorm, and SSM-specific parameters
+    (A_log, dt_bias) are excluded from weight decay.
+
+    CITATION: V-JEPA app/vjepa/utils.py — separate param groups for AdamW.
+    """
+    no_decay_keywords = ['bias', 'norm', 'A_log', 'dt_bias', 'cls_token',
+                         'pos_embed', 'mask_token']
+    decay_params = []
+    no_decay_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if any(kw in name.lower() for kw in no_decay_keywords):
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+
+    return [
+        {'params': decay_params, 'weight_decay': weight_decay},
+        {'params': no_decay_params, 'weight_decay': 0.0}
+    ]
+
+
 def train():
     parser = argparse.ArgumentParser(description="ARC-JEPA Training Loop")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size per GPU")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--warmup_epochs", type=int, default=5, help="LR warmup epochs")
+    parser.add_argument("--weight_decay", type=float, default=0.05, help="AdamW weight decay")
     parser.add_argument("--context_ratio", type=float, default=0.7)
     parser.add_argument("--use_curriculum", action="store_true", help="Use curriculum learning for context ratio")
     parser.add_argument("--curriculum_start", type=float, default=0.9, help="Starting context ratio for curriculum")
@@ -83,14 +115,12 @@ def train():
     parser.add_argument("--data_dir", type=str, default=str(PROJECT_ROOT / "data" / "recordings"))
     parser.add_argument("--output_dir", type=str, default=str(PROJECT_ROOT / "checkpoints"))
     parser.add_argument("--recon_weight", type=float, default=0.01)
+    parser.add_argument("--reg_coeff", type=float, default=1.0, help="V-JEPA variance regularization coefficient")
     parser.add_argument("--deepspeed", action="store_true", help="Use DeepSpeed for training")
     parser.add_argument("--local_rank", type=int, default=-1, help="Local rank for distributed training")
+    parser.add_argument("--resume_checkpoint", type=str, default=None, help="Path to checkpoint .pt file to resume training from")
 
     # Research extension flags
-    parser.add_argument("--use_vicreg", action="store_true", help="Enable VICReg covariance loss")
-    parser.add_argument("--vicreg_weight", type=float, default=25.0, help="VICReg covariance weight on raw latents")
-    parser.add_argument("--var_weight", type=float, default=25.0, help="VICReg variance weight (separate from cov_weight)")
-    parser.add_argument("--proj_cov_weight", type=float, default=5.0, help="VICReg covariance weight on projector outputs (keeps projector spanning full 1024D)")
     parser.add_argument("--multistep_k", type=int, default=1, help="Number of steps for multi-step prediction")
     parser.add_argument("--use_focal", action="store_true", help="Enable focal loss for reconstruction")
     parser.add_argument("--focal_alpha", type=float, default=0.25, help="Focal loss alpha parameter")
@@ -109,8 +139,6 @@ def train():
         args.batch_size = 4
 
     # gdntpu (pure-PyTorch) is used on any non-CUDA path (TPU or CPU).
-    # It requires strictly static sequence lengths so XLA can trace and cache
-    # a single compiled graph.  We must never feed a partial final batch.
     use_gdntpu = IS_TPU or not torch.cuda.is_available()
 
     if IS_TPU:
@@ -123,7 +151,6 @@ def train():
         rank = accelerator.process_index
     else:
         accelerator = None
-        # Initialize Distributed environment
         rank, world_size, local_rank = setup_dist(args.local_rank)
         is_main_process = (rank == 0)
         device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
@@ -133,53 +160,43 @@ def train():
         if is_main_process:
             print(f"🚀 Using FastHFARCDataset to stream from HuggingFace repo: {args.hf_repo_id}")
         dataset = FastHFARCDataset(
-            hf_repo_id=args.hf_repo_id, 
-            split="train", 
+            hf_repo_id=args.hf_repo_id,
+            split="train",
             compute_temporal_masks=args.compute_temporal_masks
         )
     else:
         data_path = Path(args.data_dir)
         if is_main_process:
             data_path.mkdir(parents=True, exist_ok=True)
-        
-        # Wait for directory creation if multi-gpu
+
         if IS_TPU:
             accelerator.wait_for_everyone()
         elif world_size > 1: dist.barrier()
-        
-        # Check if files exist and generate if necessary (Main process only)
+
         if is_main_process:
             if not check_training_files_exist(data_path):
                 print(f"No recordings found in {args.data_dir} (or its subdirectories). Generating real trajectories via ARC-AGI...")
                 create_mock_trajectory(args.data_dir, num_trajectories=args.num_trajectories)
             else:
                 print(f"Training files found in {args.data_dir}. Skipping data generation.")
-            
-        # ALL processes wait for generation to finish
+
         if IS_TPU:
             accelerator.wait_for_everyone()
         elif world_size > 1: dist.barrier()
-        
-        # CRITICAL: ALL processes re-read the directory after potential generation
-        # Now strictly pointing to the 'train' split to prevent data contamination
+
         train_data_path = data_path / "train"
         recording_files = list(train_data_path.glob("*.jsonl"))
-        
+
         if not recording_files:
             print(f"Warning: No recordings found in {train_data_path}. Ensure generation completed.")
-            # Fallback to direct path if the user didn't use the split generator
             recording_files = list(data_path.glob("*.jsonl"))
-            
+
         if not recording_files:
             if is_main_process: print("Error: No .jsonl files found.")
             sys.exit(1)
 
-        # IMPORTANT — XLA static-shape requirement:
-        # window_size must be a multiple of the GDN chunk_size (64) so that the
-        # padded sequence length never changes between batches.  A window of 64
-        # means every batch has shape [B, 64, H, W] — a single static XLA graph.
         gdn_chunk_size = 64
-        window_size = gdn_chunk_size  # 64 steps per trajectory window
+        window_size = gdn_chunk_size
         dataset = ARCTrajectoryDataset(
             [str(f) for f in recording_files],
             window_size=window_size,
@@ -188,7 +205,6 @@ def train():
             filter_noops=args.filter_noops
         )
 
-        # Validate ARC compliance
         if is_main_process:
             dataset.validate_arc_compliance()
 
@@ -196,8 +212,7 @@ def train():
         sampler = None
     else:
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
-    
-    # Use num_workers=0 for distributed to avoid potential multiproc deadlocks on some systems
+
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -205,28 +220,23 @@ def train():
         sampler=sampler,
         num_workers=12,
         pin_memory=not IS_TPU,
-        # drop_last MUST be True on any path that uses gdntpu (TPU or CPU).
-        # XLA traces one compiled graph per unique input shape.  A partial
-        # final batch would create a second distinct graph, doubling compile
-        # time and potentially causing out-of-memory during the second trace.
         drop_last=use_gdntpu,
     )
 
     # 2. Initialize Model & Components
     model = ARCJEPAWorldModel(
-        d_model=512,  # Increased from 256
-        num_vit_layers=6,  # Increased from 4
-        num_gdn_heads=8,  # Increased from 4
+        d_model=512,
+        num_vit_layers=6,
+        num_gdn_heads=8,
         multistep_k=args.multistep_k
     )
     if not IS_TPU:
         model = model.to(device)
-    
+
     # DeepSpeed Integration (Optional)
     if not IS_TPU and args.deepspeed:
         try:
             import deepspeed
-            # DeepSpeed expects local_rank in its init
             ds_config = {
                 "train_batch_size": args.batch_size * world_size,
                 "optimizer": {"type": "AdamW", "params": {"lr": args.lr}},
@@ -245,24 +255,32 @@ def train():
     if not IS_TPU and world_size > 1 and not args.deepspeed:
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
+    # ── Loss ──────────────────────────────────────────────────────────────────
     criterion = ARCJPELoss(
         recon_weight=args.recon_weight,
-        use_vicreg=args.use_vicreg,
-        vicreg_weight=args.vicreg_weight,
-        var_weight=args.var_weight,
-        proj_cov_weight=args.proj_cov_weight,
+        reg_coeff=args.reg_coeff,
         use_focal=args.use_focal,
         focal_alpha=args.focal_alpha,
         focal_gamma=args.focal_gamma,
         temporal_weight_multiplier=args.temporal_weight
     )
+
+    # ── Optimizer with proper weight decay groups (E4 fix) ────────────────────
     if IS_TPU or not args.deepspeed:
-        optimizer = optim.AdamW(model.parameters(), lr=args.lr)
-        
+        unwrapped_for_params = model
+        if IS_TPU:
+            # Don't unwrap yet — accelerator.prepare hasn't been called
+            pass
+        elif hasattr(model, 'module'):
+            unwrapped_for_params = model.module
+
+        param_groups = _build_param_groups(unwrapped_for_params, args.weight_decay)
+        optimizer = optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.999), eps=1e-8)
+
     if IS_TPU:
         model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
-    
-    # EMA Updater
+
+    # ── EMA Updater ───────────────────────────────────────────────────────────
     if IS_TPU:
         unwrapped = accelerator.unwrap_model(model)
         online_enc = unwrapped.online_encoder
@@ -270,11 +288,76 @@ def train():
     else:
         online_enc = model.module.online_encoder if hasattr(model, 'module') else model.online_encoder
         target_enc = model.module.target_encoder if hasattr(model, 'module') else model.target_encoder
-        
+
     # I-JEPA paper: start tau=0.996, linearly anneal to 1.0 throughout training.
-    # This creates a stronger learning signal early (target diverges more from online)
-    # and gradually stabilises as training converges.
     ema_updater = EMAUpdater(online_enc, target_enc, tau_start=0.996, tau_end=1.0)
+
+    # ── Cosine LR Schedule with Warmup (E1 fix) ──────────────────────────────
+    # CITATION: V-JEPA uses warmup + cosine decay.
+    total_steps = args.epochs * len(dataloader)
+    warmup_steps = args.warmup_epochs * len(dataloader)
+
+    def lr_lambda(step):
+        if step < warmup_steps:
+            # Linear warmup from 0 to 1
+            return float(step) / float(max(1, warmup_steps))
+        else:
+            # Cosine decay from 1 to 0
+            progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    # ── CHECKPOINT CONTINUATION MECHANISM ─────────────────────────────────────
+    start_epoch = 0
+    global_step = 0
+    if args.resume_checkpoint and os.path.exists(args.resume_checkpoint):
+        if is_main_process:
+            print(f"Loading checkpoint from {args.resume_checkpoint}...")
+
+        checkpoint = torch.load(args.resume_checkpoint, map_location='cpu')
+
+        if 'model_state_dict' not in checkpoint:
+            state_dict = checkpoint
+            opt_dict = None
+            ckpt_epoch = 0
+            import re
+            match = re.search(r'epoch_(\d+)', args.resume_checkpoint)
+            if match:
+                ckpt_epoch = int(match.group(1))
+            if is_main_process:
+                print(f"Legacy checkpoint detected. Restoring weights without optimizer states (extracted epoch {ckpt_epoch} from filename).")
+        else:
+            state_dict = checkpoint['model_state_dict']
+            opt_dict = checkpoint.get('optimizer_state_dict', None)
+            ckpt_epoch = checkpoint.get('epoch', 0)
+
+        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+
+        if IS_TPU:
+            unwrapped = accelerator.unwrap_model(model)
+            unwrapped.load_state_dict(state_dict, strict=False)
+        else:
+            unwrapped = model.module if hasattr(model, 'module') else model
+            unwrapped.load_state_dict(state_dict, strict=False)
+
+        if opt_dict is not None and not args.deepspeed:
+            try:
+                optimizer.load_state_dict(opt_dict)
+            except ValueError:
+                if is_main_process:
+                    print("Optimizer state incompatible (architecture changed). Starting fresh optimizer.")
+
+        start_epoch = ckpt_epoch
+        global_step = start_epoch * len(dataloader)
+
+        # Advance scheduler to match
+        for _ in range(global_step):
+            scheduler.step()
+
+        if is_main_process:
+            print(f"Successfully resumed. Starting from Epoch {start_epoch + 1}")
+    # ──────────────────────────────────────────────────────────────────────────
 
     # Initialize logger
     logger = None
@@ -296,7 +379,6 @@ def train():
                 args.logger = "csv"
 
         if args.logger == "csv":
-            # CSV logger will be handled manually
             csv_path = Path(args.output_dir) / "metrics.csv"
             csv_path.parent.mkdir(exist_ok=True)
             logger = None
@@ -304,31 +386,24 @@ def train():
     # 3. Training Loop
     model.train()
     if is_main_process:
-        print(f"Starting training on {world_size} GPU(s) using {'DeepSpeed' if args.deepspeed else 'DDP'}...")
+        print(f"Starting training on {world_size} device(s) using {'DeepSpeed' if args.deepspeed else 'DDP'}...")
         print(f"Dataset size: {len(dataset)}")
-        print(f"Extensions: VICReg={args.use_vicreg}, MultiStep={args.multistep_k}, Focal={args.use_focal}")
+        print(f"Total steps: {total_steps}, Warmup steps: {warmup_steps}")
+        print(f"Extensions: MultiStep={args.multistep_k}, Focal={args.use_focal}")
         if use_gdntpu:
             print(
                 "Note: First forward+backward pass will take several minutes while "
-                "XLA traces and compiles the GDN graph (pure_chunk_gated_delta_rule "
-                "nested loops + all surrounding ops). Every subsequent batch will be "
+                "XLA traces and compiles the GDN graph. Every subsequent batch will be "
                 "lightning fast — the compiled graph is cached for the entire run."
             )
         else:
             print("Note: First batch may take ~30 s for Triton kernel JIT compilation.")
 
-    # CSV logging setup
     csv_metrics = []
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         if sampler: sampler.set_epoch(epoch)
         total_loss = 0
-
-        # I-JEPA EMA annealing: linearly increase tau from tau_start to tau_end.
-        # progress=0.0 at epoch 0 → tau=tau_start (0.996)
-        # progress=1.0 at last epoch → tau=tau_end (1.0)
-        ema_progress = epoch / max(1, args.epochs - 1)
-        ema_updater.set_progress(ema_progress)
 
         # Curriculum learning for context ratio
         if args.use_curriculum:
@@ -346,6 +421,12 @@ def train():
 
             if not IS_TPU:
                 batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+
+            # ── Per-step EMA momentum update (E2 fix) ─────────────────────
+            # CITATION: V-JEPA train.py line 302-303, 484 — momentum updated
+            # per iteration, not per epoch.
+            ema_progress = global_step / max(1, total_steps - 1)
+            ema_updater.set_progress(ema_progress)
 
             if args.deepspeed and not IS_TPU:
                 outputs = model(batch, context_ratio=context_ratio, use_teacher_forcing=True)
@@ -367,22 +448,25 @@ def train():
                 loss_dict = criterion(outputs, batch)
                 loss = loss_dict['loss']
                 loss.backward()
+                # ── Gradient clipping on all paths (E3 fix) ───────────────
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
 
+            # ── Step LR scheduler ─────────────────────────────────────────
+            scheduler.step()
+
+            # ── EMA update ────────────────────────────────────────────────
             ema_updater.update()
             total_loss += loss.detach()
+            global_step += 1
 
             # Compute comprehensive metrics (every 10 batches)
-            # CRITICAL: Move all metric computation to CPU after a single sync
-            # to prevent graph breaks from .item(), eigvalsh, histc, etc.
             if batch_idx % 10 == 0:
-                # Single sync point — flush the XLA graph
                 if IS_TPU:
                     import torch_xla.core.xla_model as xm
                     xm.mark_step()
 
                 with torch.no_grad():
-                    # Transfer to CPU ONCE, then compute metrics without graph breaks
                     target_lat_cpu = outputs['target_latents'].detach().cpu()
                     logits_cpu = outputs['decoder_logits'].detach().cpu()
                     final_state_cpu = batch['final_state'].detach().cpu() if isinstance(batch['final_state'], torch.Tensor) else batch['final_state']
@@ -406,7 +490,6 @@ def train():
                     grad_metrics = compute_gradient_metrics(model)
                     data_metrics = compute_data_statistics(states_cpu, target_states_cpu, seq_mask=seq_mask_cpu)
 
-                    # Materialize loss_dict values to Python floats for logging
                     loss_dict_cpu = {}
                     for k_name, v_val in loss_dict.items():
                         if isinstance(v_val, torch.Tensor):
@@ -414,11 +497,12 @@ def train():
                         else:
                             loss_dict_cpu[k_name] = v_val
 
-                    # Aggregate all metrics
+                    current_lr = scheduler.get_last_lr()[0] if hasattr(scheduler, 'get_last_lr') else optimizer.param_groups[0]['lr']
+
                     metrics = {
                         'epoch': epoch + 1,
                         'batch': batch_idx,
-                        'lr': optimizer.param_groups[0]['lr'] if not args.deepspeed else args.lr,
+                        'lr': current_lr,
                         **loss_dict_cpu,
                         **latent_metrics,
                         **pred_metrics,
@@ -426,57 +510,54 @@ def train():
                         **data_metrics
                     }
 
-                    # Log to backend
                     if is_main_process:
                         if args.logger == "wandb" and logger is not None:
                             logger.log(metrics)
                         elif args.logger == "tensorboard" and logger is not None:
                             for key, value in metrics.items():
                                 if isinstance(value, (int, float)):
-                                    logger.add_scalar(key, value, epoch * len(dataloader) + batch_idx)
+                                    logger.add_scalar(key, value, global_step)
                         else:
-                            # CSV logging
                             csv_metrics.append(metrics)
 
-                        # Print critical metrics
                         print(f"Epoch [{epoch+1}/{args.epochs}] Batch [{batch_idx}/{len(dataloader)}]")
-                        print(f"  Loss: {loss_dict_cpu['loss']:.4f} | JEPA: {loss_dict_cpu['jepa_loss']:.4f} | Recon: {loss_dict_cpu['recon_loss']:.4f} | Std: {loss_dict_cpu['std_loss']:.4f} | Policy: {loss_dict_cpu['policy_loss']:.4f}")
+                        print(f"  Loss: {loss_dict_cpu['loss']:.4f} | JEPA: {loss_dict_cpu['jepa_loss']:.4f} | Recon: {loss_dict_cpu['recon_loss']:.4f} | VarReg: {loss_dict_cpu['var_reg']:.4f} | Policy: {loss_dict_cpu['policy_loss']:.4f}")
                         print(f"  Latent: std={latent_metrics['latent_std_mean']:.3f} rank={latent_metrics['effective_rank']:.1f} corr={latent_metrics['latent_correlation_max']:.3f}")
                         print(f"  Accuracy: pixel={pred_metrics['pixel_accuracy']:.3f} fg={pred_metrics['foreground_accuracy']:.3f} bg={pred_metrics['background_accuracy']:.3f}")
                         if args.compute_temporal_masks:
                             print(f"  Temporal: changed={pred_metrics['changed_pixel_accuracy']:.3f} unchanged={pred_metrics['unchanged_pixel_accuracy']:.3f}")
                         print(f"  Data: noop={data_metrics['noop_ratio']:.3f} fg_ratio={data_metrics['foreground_ratio']:.3f}")
-                        if args.use_vicreg:
-                            print(f"  VICReg: cov_raw={loss_dict_cpu['cov_loss_raw']:.4f} cov_proj={loss_dict_cpu['cov_loss_proj']:.4f} std={loss_dict_cpu['std_loss']:.4f}")
                         if args.multistep_k > 1:
                             print(f"  MultiStep: loss={loss_dict_cpu['multistep_jepa_loss']:.4f}")
-                        print(f"  EMA tau={ema_updater.tau:.5f}")
+                        print(f"  EMA tau={ema_updater.tau:.5f} | LR={current_lr:.6f}")
 
         # ── Epoch End ────────────────────────────────────────────────────────────
-        # CRITICAL: wait_for_everyone() is a collective barrier — ALL 8 processes
-        # must call it simultaneously. It MUST be outside is_main_process blocks
-        # or the 7 non-main processes never reach it and main hangs indefinitely.
         if IS_TPU:
             import torch_xla.core.xla_model as xm
-            xm.mark_step()                  # flush XLA graph before barrier
-            accelerator.wait_for_everyone() # all 8 cores sync here
+            xm.mark_step()
+            accelerator.wait_for_everyone()
 
         if is_main_process:
-            # Materialize avg_loss after the barrier (avoids premature device sync)
             avg_loss = (total_loss / len(dataloader)).item() if isinstance(total_loss, torch.Tensor) else total_loss / len(dataloader)
             print(f"Epoch [{epoch+1}/{args.epochs}] Average Loss: {avg_loss:.4f}")
 
-            # Save Checkpoint
             save_path = Path(args.output_dir)
             save_path.mkdir(exist_ok=True)
+
+            checkpoint_dict = {
+                'epoch': epoch + 1,
+                'global_step': global_step,
+                'optimizer_state_dict': optimizer.state_dict()
+            }
+
             if IS_TPU:
                 unwrapped_model = accelerator.unwrap_model(model)
-                torch.save(unwrapped_model.state_dict(), save_path / f"world_model_epoch_{epoch+1}.pt")
+                checkpoint_dict['model_state_dict'] = unwrapped_model.state_dict()
             else:
-                state_to_save = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
-                torch.save(state_to_save, save_path / f"world_model_epoch_{epoch+1}.pt")
+                checkpoint_dict['model_state_dict'] = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
 
-            # Save CSV metrics for this epoch
+            torch.save(checkpoint_dict, save_path / f"world_model_epoch_{epoch+1}.pt")
+
             if args.logger == "csv" and csv_metrics:
                 import csv
                 csv_file = save_path / f"metrics_epoch_{epoch+1}.csv"
@@ -484,7 +565,7 @@ def train():
                     writer = csv.DictWriter(f, fieldnames=csv_metrics[0].keys())
                     writer.writeheader()
                     writer.writerows(csv_metrics)
-                csv_metrics = []  # Reset for next epoch
+                csv_metrics = []
 
     if is_main_process:
         print("Training Complete!")

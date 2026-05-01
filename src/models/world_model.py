@@ -1,25 +1,19 @@
 """
-# 1. Strip the rogue multi-host environment variables
-unset TPU_PROCESS_ADDRESSES
-unset CLOUD_TPU_TASK_ID
+ARC-JEPA World Model — V-JEPA-faithful architecture.
 
-# 2. Set the modern XLA backend
-export PJRT_DEVICE=TPU
+Combines:
+  - Spatial encoder (DiscreteViT) for per-frame encoding
+  - Temporal model (GDN in Transformer block) for context processing
+  - Transformer predictor (V-JEPA style) for next-state prediction
+  - EMA target encoder for self-supervised targets
+  - Grid decoder for pixel-level reconstruction
+  - Policy head for AlphaZero-style action prediction
 
-# 3. Launch
-accelerate launch --num_processes 8 train.py \
-  --batch_size 8 \
-  --epochs 10 \
-  --lr 1e-4 \
-  --context_ratio 0.7 \
-  --recon_weight 1.0 \
-  --use_vicreg \
-  --vicreg_weight 25.0 \
-  --multistep_k 3 \
-  --use_focal \
-  --compute_temporal_masks \
-  --filter_noops \
-  --logger csv
+Key design decisions:
+  1. GDN processes context latents and feeds into predictor (C1 fix)
+  2. Single encoding pass — no redundant re-encoding (D2 fix)
+  3. No projector — JEPA loss in native encoder space (A1 fix)
+  4. Target latents are layer-normalized (V-JEPA faithful)
 """
 
 import torch
@@ -65,14 +59,16 @@ class ARCJEPAWorldModel(nn.Module):
         for param in self.target_encoder.parameters():
             param.requires_grad = False
 
-        # Temporal / Sequence Model
+        # Temporal / Sequence Model (GDN wrapped in Transformer block)
         self.gdn = GDNSequenceModel(d_model, n_heads=num_gdn_heads)
 
-        # Predictor (Lightweight MLP with bottleneck)
+        # Predictor — V-JEPA Transformer Predictor
+        # Context features from GDN attend to action-conditioned mask tokens
         self.predictor = JEPAPredictor(
             d_model=d_model,
             num_layers=predictor_layers,
-            bottleneck_dim=predictor_bottleneck
+            bottleneck_dim=predictor_bottleneck,
+            num_heads=max(1, predictor_bottleneck // 32),  # ~12 heads for 384
         )
 
         # Final State Decoder
@@ -85,15 +81,6 @@ class ARCJEPAWorldModel(nn.Module):
             nn.LayerNorm(d_model),
             nn.GELU(),
             nn.Linear(d_model, 9 + 64 + 64) # 9 actions + 64x + 64y
-        )
-
-        # VICReg Projector (for disentangling features in a higher-dimensional space)
-        # This prevents the core latents from being too constrained by the covariance penalty
-        self.projector = nn.Sequential(
-            nn.Linear(d_model, 1024),
-            nn.LayerNorm(1024),
-            nn.ReLU(),
-            nn.Linear(1024, 1024)
         )
 
     def encode(self, grids: torch.Tensor, encoder: nn.Module) -> torch.Tensor:
@@ -132,18 +119,19 @@ class ARCJEPAWorldModel(nn.Module):
         use_teacher_forcing: bool = True
     ) -> Dict[str, torch.Tensor]:
         """
-        Forward pass with teacher forcing and no GDN feedback loop.
+        Forward pass with teacher forcing.
 
-        Key changes from original:
-        - Teacher forcing: use ground truth states as predictor input
-        - GDN only for context processing, NOT in prediction loop
-        - Store RAW predictor outputs for loss (no GDN processing)
-        - Increased default context_ratio from 0.3 to 0.7
+        Architecture flow:
+          1. Encode all input states with online encoder (single pass)
+          2. Process context window through GDN for temporal features
+          3. Predict future states using Transformer predictor with
+             GDN context + action-conditioned mask tokens
+          4. Encode target states with EMA target encoder
 
         Args:
             batch: Dictionary with states, actions, coords, target_states
             context_ratio: Fraction of sequence used as context (default 0.7)
-            use_teacher_forcing: Use ground truth states during training (default True)
+            use_teacher_forcing: Use ground truth states during training
 
         Returns:
             Dictionary with pred_latents, target_latents, decoder_logits, policy_logits
@@ -157,39 +145,47 @@ class ARCJEPAWorldModel(nn.Module):
         K = max(1, int(T * context_ratio))
 
         # ═══════════════════════════════════════════════════════
-        # PHASE 1: CONTEXT ENCODING (with GDN)
+        # PHASE 1: ENCODE ALL INPUT STATES (single pass — D2 fix)
         # ═══════════════════════════════════════════════════════
 
-        # Encode context states with online encoder
-        s_context = self.encode(states[:, :K], self.online_encoder)  # [B, K, d_model]
-
-        # Process context with GDN for temporal features
-        s_context_features, _ = self.gdn(s_context, use_cache=True)
+        # Encode all T-1 input states with online encoder in one shot.
+        # Previously encoded context separately then re-encoded for
+        # prediction — wasting compute.
+        all_online_latents = self.encode(states[:, :T-1], self.online_encoder)  # [B, T-1, d_model]
 
         # ═══════════════════════════════════════════════════════
-        # PHASE 2: TEACHER-FORCED PREDICTION (NO GDN)
+        # PHASE 2: GDN CONTEXT PROCESSING (C1 fix — GDN awakened)
+        # ═══════════════════════════════════════════════════════
+
+        # Process context window through GDN for temporal features.
+        # The GDN's Transformer block (pre-norm + residual + FFN) produces
+        # context representations with temporal coherence.
+        context_latents = all_online_latents[:, :K]          # [B, K, d_model]
+        context_features, _ = self.gdn(context_latents, use_cache=True)  # [B, K, d_model]
+
+        # ═══════════════════════════════════════════════════════
+        # PHASE 3: TRANSFORMER PREDICTION
         # ═══════════════════════════════════════════════════════
 
         if use_teacher_forcing:
-            # TEACHER FORCING: Use ground truth states as input
-            all_states_encoded = self.encode(states[:, :T-1], self.online_encoder)  # [B, T-1, d_model]
-
-            # Vectorized action embeddings: embed the full prediction window in one op.
-            # Slicing before embedding avoids a Python for-loop that would add T separate
-            # nodes to the XLA graph.
+            # Action embeddings for the prediction window
             action_embeds = self.action_embed(
                 actions[:, K-1:T-1],   # [B, T-K]
                 cx[:, K-1:T-1],
                 cy[:, K-1:T-1]
             )  # [B, T-K, d_model]
 
-            # Batch prediction
-            s_input = all_states_encoded[:, K-1:T-1]         # [B, T-K, d_model]
-            pred_latents = self.predictor(s_input, action_embeds, step_idx=K-1)  # [B, T-K, d_model]
+            # Transformer predictor: GDN context + action-conditioned targets
+            # Context features attend to mask tokens via self-attention,
+            # enabling each prediction to leverage the full temporal context.
+            pred_latents = self.predictor(
+                context_features,   # [B, K, d_model] — GDN-processed context
+                action_embeds,      # [B, T-K, d_model] — action conditioning
+            )  # [B, T-K, d_model]
 
             # Multi-step prediction (auxiliary loss)
             if self.multistep_k > 1 and K-1 + self.multistep_k <= T:
-                s_init = all_states_encoded[:, K-1]           # [B, d_model]
+                s_init = all_online_latents[:, K-1]  # [B, d_model]
                 action_embeds_k = self.action_embed(
                     actions[:, K-1 : K-1+self.multistep_k],
                     cx[:, K-1 : K-1+self.multistep_k],
@@ -205,39 +201,41 @@ class ARCJEPAWorldModel(nn.Module):
         else:
             # AUTOREGRESSIVE: Use previous predictions (inference mode)
             pred_latents = []
-            curr_state = s_context_features[:, -1]  # [B, d_model]
+            # Start with GDN-processed context as initial context
+            context_for_ar = context_features  # [B, K, d_model]
 
             for t in range(K-1, T-1):
-                z_a = self.action_embed(actions[:, t], cx[:, t], cy[:, t])
+                z_a = self.action_embed(
+                    actions[:, t], cx[:, t], cy[:, t]
+                ).unsqueeze(1)  # [B, 1, d_model]
 
-                # Predict next state (NO GDN processing)
+                # Predict next state using full context
                 s_next_pred = self.predictor(
-                    curr_state.unsqueeze(1),
-                    z_a.unsqueeze(1),
-                    step_idx=t
-                ).squeeze(1)
+                    context_for_ar,  # [B, ctx_len, d_model]
+                    z_a,             # [B, 1, d_model]
+                ).squeeze(1)  # [B, d_model]
 
                 pred_latents.append(s_next_pred)
-                curr_state = s_next_pred  # Autoregressive
+
+                # Expand context with prediction for next step
+                context_for_ar = torch.cat(
+                    [context_for_ar, s_next_pred.unsqueeze(1)], dim=1
+                )
 
             pred_latents = torch.stack(pred_latents, dim=1)
             multistep_pred_latents = None
 
         # ═══════════════════════════════════════════════════════
-        # PHASE 3: TARGET ENCODING (EMA)
+        # PHASE 4: TARGET ENCODING (EMA)
         # ═══════════════════════════════════════════════════════
 
         with torch.no_grad():
-            # Encode target states with target encoder (raw embeddings)
-            # Slice K-1:T-1 (grids[K...T-1]) to match pred_latents
+            # Encode target states with target encoder
             s_next_target = self.encode(target_grids[:, K-1:T-1], self.target_encoder)
 
-            # Normalise target representations over the feature dimension.
+            # Layer-normalize target representations
             # CITATION: V-JEPA official vjepa/train.py, forward_target(), line 426:
-            #   h = F.layer_norm(h, (h.size(-1),))  # normalize over feature-dim
-            # This stabilises the target representation scale as EMA tau
-            # anneals toward 1.0 (target encoder nearly frozen) and prevents
-            # the JEPA MSE loss scale from drifting across training.
+            #   h = F.layer_norm(h, (h.size(-1),))
             s_next_target = F.layer_norm(s_next_target, (s_next_target.size(-1),))
 
             # Multi-step targets
@@ -254,7 +252,7 @@ class ARCJEPAWorldModel(nn.Module):
                 multistep_target_latents = None
 
         # ═══════════════════════════════════════════════════════
-        # PHASE 4: AUXILIARY OUTPUTS
+        # PHASE 5: AUXILIARY OUTPUTS
         # ═══════════════════════════════════════════════════════
 
         # Decode final predicted state
@@ -263,27 +261,9 @@ class ARCJEPAWorldModel(nn.Module):
         # Policy logits
         policy_logits = self.policy_head(pred_latents)
 
-        # VICReg Projection on PRED latents only (online encoder → projector).
-        # projected_pred receives gradients from the covariance loss on
-        # projector outputs, keeping the projector's 1024D space decorrelated.
-        projected_pred_latents = self.projector(pred_latents)
-
-        # CRITICAL: Projector target path must have NO gradients.
-        # Previously self.projector(s_next_target) was called outside no_grad,
-        # giving the projector gradient signal from the EMA-frozen target path.
-        # This trained the projector to map ANY input close to the prediction —
-        # a direct collapse shortcut. Wrapping in no_grad eliminates it.
-        # CITATION: Official I-JEPA/V-JEPA has no projector at all; the loss
-        # is computed directly in encoder space. This is the closest safe
-        # approximation when keeping the projector for the cov_proj term.
-        with torch.no_grad():
-            projected_target_latents = self.projector(s_next_target)
-
         output = {
             'pred_latents': pred_latents,
             'target_latents': s_next_target,
-            'projected_pred_latents': projected_pred_latents,
-            'projected_target_latents': projected_target_latents,
             'decoder_logits': final_state_logits,
             'policy_logits': policy_logits
         }
