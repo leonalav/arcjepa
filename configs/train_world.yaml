@@ -1,0 +1,5 @@
+data_dir: data/train_shards/pretrain_v0001
+output_dir: checkpoints_world
+epochs: 10
+batch_size: 8
+lr: 0.00015

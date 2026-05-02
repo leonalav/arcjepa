@@ -19,6 +19,7 @@ class ARCJPELoss(nn.Module):
         terminal_weight: float = 0.1,
         value_weight: float = 0.1,
         efficiency_weight: float = 0.1,
+        visit_policy_weight: float = 0.0,
         num_actions: int = DEFAULT_NUM_ACTIONS,
     ):
         super().__init__()
@@ -31,6 +32,7 @@ class ARCJPELoss(nn.Module):
         self.terminal_weight = terminal_weight
         self.value_weight = value_weight
         self.efficiency_weight = efficiency_weight
+        self.visit_policy_weight = visit_policy_weight
         self.num_actions = num_actions
 
         if self.use_focal:
@@ -117,12 +119,35 @@ class ARCJPELoss(nn.Module):
         terminal_loss = (terminal_loss * seq_mask).sum() / (seq_mask.sum() + 1e-8)
 
         success_target = targets.get('success', torch.zeros(B, targets['actions'].shape[1], device=pred_latents.device))[:, pred_slice].to(pred_latents.device).float()
-        score_target = targets.get('score', success_target)[:, pred_slice].to(pred_latents.device).float() if 'score' in targets else success_target
-        value_target = torch.maximum(success_target, score_target.clamp(0.0, 1.0))
-        value_loss = F.mse_loss(torch.sigmoid(outputs['value_pred']) * seq_mask, value_target * seq_mask, reduction='sum') / (seq_mask.sum() + 1e-8)
+        episode_success = targets.get('episode_success', success_target)[:, pred_slice].to(pred_latents.device).float() if 'episode_success' in targets else success_target
+        if 'return_to_go' in targets:
+            value_target = targets['return_to_go'][:, pred_slice].to(pred_latents.device).float().clamp(0.0, 1.0)
+            value_loss_unreduced = F.mse_loss(torch.sigmoid(outputs['value_pred']), value_target, reduction='none')
+        else:
+            value_target = episode_success
+            value_loss_unreduced = F.binary_cross_entropy_with_logits(outputs['value_pred'], value_target, reduction='none')
+        value_loss = (value_loss_unreduced * seq_mask).sum() / (seq_mask.sum() + 1e-8)
 
-        efficiency_target = targets.get('efficiency_target', success_target)[:, pred_slice].to(pred_latents.device).float() if 'efficiency_target' in targets else success_target
-        efficiency_loss = F.mse_loss(torch.sigmoid(outputs['efficiency_pred']) * seq_mask, efficiency_target * seq_mask, reduction='sum') / (seq_mask.sum() + 1e-8)
+        if 'efficiency_target' in targets:
+            efficiency_target = targets['efficiency_target'][:, pred_slice].to(pred_latents.device).float().clamp(0.0, 1.0)
+        elif 'steps_to_win' in targets:
+            steps = targets['steps_to_win'][:, pred_slice].to(pred_latents.device).float().clamp_min(1.0)
+            efficiency_target = episode_success / steps
+        else:
+            efficiency_target = success_target
+        efficiency_loss_unreduced = F.mse_loss(torch.sigmoid(outputs['efficiency_pred']), efficiency_target, reduction='none')
+        efficiency_loss = (efficiency_loss_unreduced * seq_mask).sum() / (seq_mask.sum() + 1e-8)
+
+        if self.visit_policy_weight > 0 and 'mcts_visit_policy' in targets:
+            visit_target = targets['mcts_visit_policy'][:, pred_slice].to(pred_latents.device).float()
+            visit_sum = visit_target.sum(dim=-1, keepdim=True)
+            has_visit = (visit_sum.squeeze(-1) > 0) & (seq_mask > 0)
+            visit_target = visit_target / visit_sum.clamp_min(1e-8)
+            visit_log_probs = F.log_softmax(action_logits, dim=-1)
+            visit_kl_unreduced = F.kl_div(visit_log_probs, visit_target, reduction='none').sum(dim=-1)
+            visit_policy_loss = (visit_kl_unreduced * has_visit.float()).sum() / (has_visit.float().sum() + 1e-8)
+        else:
+            visit_policy_loss = torch.tensor(0.0, device=pred_latents.device)
 
         if 'multistep_pred_latents' in outputs and 'multistep_target_latents' in outputs:
             multistep_jepa_loss = F.mse_loss(outputs['multistep_pred_latents'], outputs['multistep_target_latents'])
@@ -138,7 +163,8 @@ class ARCJPELoss(nn.Module):
             policy_loss +
             self.terminal_weight * terminal_loss +
             self.value_weight * value_loss +
-            self.efficiency_weight * efficiency_loss
+            self.efficiency_weight * efficiency_loss +
+            self.visit_policy_weight * visit_policy_loss
         )
 
         return {
@@ -153,4 +179,5 @@ class ARCJPELoss(nn.Module):
             'terminal_loss': terminal_loss.detach(),
             'value_loss': value_loss.detach(),
             'efficiency_loss': efficiency_loss.detach(),
+            'visit_policy_loss': visit_policy_loss.detach(),
         }

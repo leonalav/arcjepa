@@ -137,6 +137,12 @@ def _preprocess_frame_static(
     terminal, success = _terminal_success(frame_data)
     score = _score_value(extract_first(frame_data, ['score', 'reward', 'rhae', 'RHAE'], 0.0))
     step_index = int(extract_first(frame_data, ['step', 'step_index', 'timestep', 'frame_index'], 0) or 0)
+    episode_success = bool(extract_first(frame_data, ['episode_success'], success))
+    return_to_go = _score_value(extract_first(frame_data, ['return_to_go'], 1.0 if episode_success else 0.0))
+    distance_to_win = _score_value(extract_first(frame_data, ['distance_to_win'], 0.0 if episode_success else 1.0))
+    steps_to_win = int(extract_first(frame_data, ['steps_to_win'], max(1, step_index + 1)) or 1)
+    efficiency_target = _score_value(extract_first(frame_data, ['efficiency_target'], (1.0 / max(1, steps_to_win)) if episode_success else 0.0))
+    mcts_visit_policy = extract_first(frame_data, ['mcts_visit_policy', 'visit_policy', 'visit_counts'], None)
 
     return {
         'grid': torch.from_numpy(padded_grid),
@@ -151,6 +157,12 @@ def _preprocess_frame_static(
         'success': success,
         'score': score,
         'step_index': step_index,
+        'episode_success': episode_success,
+        'return_to_go': return_to_go,
+        'distance_to_win': distance_to_win,
+        'steps_to_win': steps_to_win,
+        'efficiency_target': efficiency_target,
+        'mcts_visit_policy': mcts_visit_policy,
     }
 
 
@@ -158,7 +170,9 @@ def _process_single_file(args):
     file_path, window_size, stride, max_grid_size, filter_noops, num_actions, max_games, max_game_families = args
     rows = {k: [] for k in [
         'grids', 'actions', 'xs', 'ys', 'available_masks', 'coord_masks', 'game_ids',
-        'game_families', 'terminals', 'successes', 'scores', 'step_indices'
+        'game_families', 'terminals', 'successes', 'scores', 'step_indices',
+        'episode_successes', 'returns_to_go', 'distances_to_win', 'steps_to_win',
+        'efficiency_targets', 'mcts_visit_policies'
     ]}
 
     with open(file_path, 'r') as f:
@@ -186,6 +200,12 @@ def _process_single_file(args):
             rows['successes'].append(processed['success'])
             rows['scores'].append(processed['score'])
             rows['step_indices'].append(processed['step_index'])
+            rows['episode_successes'].append(processed['episode_success'])
+            rows['returns_to_go'].append(processed['return_to_go'])
+            rows['distances_to_win'].append(processed['distance_to_win'])
+            rows['steps_to_win'].append(processed['steps_to_win'])
+            rows['efficiency_targets'].append(processed['efficiency_target'])
+            rows['mcts_visit_policies'].append(processed['mcts_visit_policy'])
 
     traj_len = len(rows['grids'])
     if traj_len < 2:
@@ -203,6 +223,16 @@ def _process_single_file(args):
     successes_tensor = torch.tensor(rows['successes'], dtype=torch.bool)
     scores_tensor = torch.tensor(rows['scores'], dtype=torch.float32)
     step_indices_tensor = torch.tensor(rows['step_indices'], dtype=torch.long)
+    episode_successes_tensor = torch.tensor(rows['episode_successes'], dtype=torch.bool)
+    returns_to_go_tensor = torch.tensor(rows['returns_to_go'], dtype=torch.float32)
+    distances_to_win_tensor = torch.tensor(rows['distances_to_win'], dtype=torch.float32)
+    steps_to_win_tensor = torch.tensor(rows['steps_to_win'], dtype=torch.long)
+    efficiency_targets_tensor = torch.tensor(rows['efficiency_targets'], dtype=torch.float32)
+    if any(v is not None for v in rows['mcts_visit_policies']):
+        policy_rows = [v if v is not None else [0.0] * num_actions for v in rows['mcts_visit_policies']]
+        mcts_visit_policies_tensor = torch.tensor(policy_rows, dtype=torch.float32)
+    else:
+        mcts_visit_policies_tensor = torch.zeros(traj_len, num_actions, dtype=torch.float32)
 
     valid_starts = []
     for i in range(0, traj_len - window_size, stride):
@@ -215,7 +245,9 @@ def _process_single_file(args):
     return (
         grids_tensor, actions_tensor, xs_tensor, ys_tensor, available_tensor, coord_tensor,
         game_ids_tensor, game_families_tensor, terminals_tensor, successes_tensor,
-        scores_tensor, step_indices_tensor, valid_starts
+        scores_tensor, step_indices_tensor, episode_successes_tensor, returns_to_go_tensor,
+        distances_to_win_tensor, steps_to_win_tensor, efficiency_targets_tensor,
+        mcts_visit_policies_tensor, valid_starts
     )
 
 
@@ -274,12 +306,13 @@ class ARCTrajectoryDataset(Dataset):
         end_idx = start_idx + self.window_size + 1
         (
             grids, actions, xs, ys, available, coord_masks, game_ids, game_families,
-            terminals, successes, scores, step_indices
+            terminals, successes, scores, step_indices, episode_successes, returns_to_go,
+            distances_to_win, steps_to_win, efficiency_targets, mcts_visit_policies
         ) = [t[start_idx:end_idx] for t in self.trajectories[traj_idx]]
 
         state_changed_mask = self._compute_temporal_mask(grids[:-1].long(), grids[1:].long())
         seq_mask = torch.ones(self.window_size, dtype=torch.float32)
-        efficiency = self._efficiency_targets(successes[:-1], step_indices[:-1])
+        efficiency = efficiency_targets[:-1].float()
 
         result = {
             'states': grids[:-1].long(),
@@ -297,6 +330,11 @@ class ARCTrajectoryDataset(Dataset):
             'score': scores[:-1].float(),
             'step_index': step_indices[:-1].long(),
             'efficiency_target': efficiency.float(),
+            'episode_success': episode_successes[:-1].float(),
+            'return_to_go': returns_to_go[:-1].float(),
+            'distance_to_win': distances_to_win[:-1].float(),
+            'steps_to_win': steps_to_win[:-1].long(),
+            'mcts_visit_policy': mcts_visit_policies[:-1].float(),
             'seq_mask': seq_mask,
             'state_changed_mask': state_changed_mask.float(),
         }
@@ -401,7 +439,13 @@ class FastHFARCDataset(Dataset):
         success = self._pad_or_window(self._item_tensor(item, 'success', torch.zeros(raw_len), torch.float32), T).float()
         score = self._pad_or_window(self._item_tensor(item, 'score', torch.zeros(raw_len), torch.float32), T).float()
         step_index = self._pad_or_window(self._item_tensor(item, 'step_index', torch.arange(raw_len), torch.long), T).long()
-        efficiency = self._pad_or_window(self._item_tensor(item, 'efficiency_target', success / (step_index.float() + 1.0), torch.float32), T).float()
+        episode_success = self._pad_or_window(self._item_tensor(item, 'episode_success', success, torch.float32), T).float()
+        return_to_go = self._pad_or_window(self._item_tensor(item, 'return_to_go', episode_success, torch.float32), T).float()
+        distance_to_win = self._pad_or_window(self._item_tensor(item, 'distance_to_win', 1.0 - episode_success, torch.float32), T).float()
+        steps_to_win = self._pad_or_window(self._item_tensor(item, 'steps_to_win', torch.full((raw_len,), T + 1), torch.long), T).long()
+        efficiency = self._pad_or_window(self._item_tensor(item, 'efficiency_target', episode_success / steps_to_win.float().clamp_min(1.0), torch.float32), T).float()
+        visit_default = torch.zeros(raw_len, self.num_actions, dtype=torch.float32)
+        mcts_visit_policy = self._pad_or_window(self._item_tensor(item, 'mcts_visit_policy', visit_default, torch.float32), T).float()
         state_changed_mask = (states != target_states).float()
 
         result = {
@@ -420,6 +464,11 @@ class FastHFARCDataset(Dataset):
             'score': score,
             'step_index': step_index,
             'efficiency_target': efficiency,
+            'episode_success': episode_success,
+            'return_to_go': return_to_go,
+            'distance_to_win': distance_to_win,
+            'steps_to_win': steps_to_win,
+            'mcts_visit_policy': mcts_visit_policy,
             'seq_mask': seq_mask,
             'state_changed_mask': state_changed_mask,
         }

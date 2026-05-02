@@ -275,6 +275,37 @@ def compute_efficiency_metrics(
     }
 
 
+def compute_value_metrics(
+    value_pred: torch.Tensor,
+    targets: Dict[str, torch.Tensor],
+    seq_mask: Optional[torch.Tensor] = None,
+) -> Dict[str, float]:
+    pred_T = value_pred.shape[1]
+    full_T = targets['actions'].shape[1]
+    K = full_T - pred_T
+    if 'return_to_go' in targets:
+        value_target = targets['return_to_go'][:, K:K + pred_T].to(value_pred.device).float().clamp(0.0, 1.0)
+    elif 'episode_success' in targets:
+        value_target = targets['episode_success'][:, K:K + pred_T].to(value_pred.device).float()
+    else:
+        value_target = targets.get('success', torch.zeros_like(targets['actions'], dtype=torch.float32))[:, K:K + pred_T].to(value_pred.device).float()
+    mask = torch.ones_like(value_target) if seq_mask is None else seq_mask[:, K:K + pred_T].to(value_pred.device).float()
+    pred = torch.sigmoid(value_pred)
+    diff = torch.abs(pred - value_target)
+    mae = (diff * mask).sum() / (mask.sum() + 1e-8)
+    brier = (((pred - value_target) ** 2) * mask).sum() / (mask.sum() + 1e-8)
+    positives = value_target > 0.5
+    negatives = ~positives
+    pos_mean = pred[positives & mask.bool()].mean().item() if (positives & mask.bool()).any() else 0.0
+    neg_mean = pred[negatives & mask.bool()].mean().item() if (negatives & mask.bool()).any() else 0.0
+    return {
+        'value_mae': mae.item(),
+        'value_brier': brier.item(),
+        'value_positive_mean': pos_mean,
+        'value_negative_mean': neg_mean,
+    }
+
+
 def compute_gradient_metrics(model: nn.Module) -> Dict[str, float]:
     """
     Compute gradient health metrics.

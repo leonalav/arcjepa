@@ -1,0 +1,7 @@
+game_ids_file: configs/game_ids/seed25.txt
+out_dir: data/raw_episodes
+workers: 1
+algorithm: random_legal
+max_steps: 100
+episodes_per_game: 1000
+seed: 0

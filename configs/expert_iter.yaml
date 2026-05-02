@@ -1,0 +1,9 @@
+iterations: 1
+game_ids_file: configs/game_ids/seed25.txt
+raw_dir: data/raw_episodes
+index_path: data/replay_index/episodes.sqlite
+shard_root: data/train_shards
+checkpoint_root: checkpoints_expert_iter
+workers: 1
+episodes_per_game: 100
+max_steps: 100
