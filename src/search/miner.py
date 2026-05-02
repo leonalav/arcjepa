@@ -27,6 +27,8 @@ class WinMiner:
         budget: SearchBudget | None = None,
         seed: int = 0,
         env_dir: str | None = None,
+        exploration_rate: float = 0.15,
+        uct_simulations: int = 200,
     ):
         self.game_ids = game_ids
         self.out_dir = Path(out_dir)
@@ -35,6 +37,8 @@ class WinMiner:
         self.budget = budget or SearchBudget(seed=seed)
         self.seed = seed
         self.env_dir = env_dir
+        self.exploration_rate = exploration_rate
+        self.uct_simulations = uct_simulations
 
     def run(self) -> MiningRunSummary:
         jobs = []
@@ -48,6 +52,8 @@ class WinMiner:
                     "seed": self.seed + game_idx * 100000 + episode_idx,
                     "env_dir": self.env_dir,
                     "episode_id": f"{game_id}-{self.algorithm}-{episode_idx:06d}",
+                    "exploration_rate": self.exploration_rate,
+                    "uct_simulations": self.uct_simulations,
                 })
         if self.workers == 1:
             results = [mine_game_worker(job) for job in jobs]

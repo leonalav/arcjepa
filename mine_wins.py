@@ -20,7 +20,12 @@ def main():
     parser.add_argument("--game_id", action="append")
     parser.add_argument("--out_dir", default="data/raw_episodes")
     parser.add_argument("--workers", type=int, default=1)
-    parser.add_argument("--algorithm", choices=["random_legal", "beam", "portfolio"], default="random_legal")
+    parser.add_argument(
+        "--algorithm",
+        choices=["random_legal", "beam", "heuristic", "env_uct", "portfolio"],
+        default="random_legal",
+        help="Search algorithm: heuristic and env_uct are the new high-win-rate options.",
+    )
     parser.add_argument("--max_steps", type=int, default=100)
     parser.add_argument("--episodes_per_game", type=int, default=1000)
     parser.add_argument("--max_nodes", type=int, default=10000)
@@ -28,6 +33,18 @@ def main():
     parser.add_argument("--max_wallclock_sec", type=float, default=3600.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--env_dir", default=None)
+    parser.add_argument(
+        "--exploration_rate",
+        type=float,
+        default=0.15,
+        help="For --algorithm heuristic: probability of random action (escape valve). Default 0.15.",
+    )
+    parser.add_argument(
+        "--uct_simulations",
+        type=int,
+        default=200,
+        help="For --algorithm env_uct / portfolio: MCTS simulation budget per episode. Default 200.",
+    )
     args = parser.parse_args()
 
     budget = SearchBudget(
@@ -46,6 +63,8 @@ def main():
         budget=budget,
         seed=args.seed,
         env_dir=args.env_dir,
+        exploration_rate=args.exploration_rate,
+        uct_simulations=args.uct_simulations,
     )
     summary = miner.run()
     print(f"Episodes: {summary.episodes}")
