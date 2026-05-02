@@ -9,6 +9,8 @@ small exploration_rate for stochastic escape from local loops.
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
+
 from src.data.arc_schema import action_uses_coordinates
 from src.data.episode_writer import EpisodeWriter, move_episode_to_outcome
 from src.data.heuristic_policy import ARCHeuristicPolicy
@@ -81,6 +83,8 @@ class HeuristicSolver:
         success = False
         final_score = obs.score
 
+        seen_grids = set()
+
         with EpisodeWriter(
             temp_path,
             episode_id=episode_id,
@@ -95,7 +99,30 @@ class HeuristicSolver:
                     final_score = obs.score
                     break
 
-                action = self._choose_action(obs)
+                submit_action = None
+                for a in obs.available_actions:
+                    if a.name == "SUBMIT" or a.action_id == 9:
+                        submit_action = a
+                        break
+                if submit_action is None and obs.available_actions:
+                    submit_action = max(obs.available_actions, key=lambda a: a.action_id)
+
+                should_submit = False
+                if submit_action is not None:
+                    grid_hash = obs.grid.tobytes()
+                    # Condition 1: Loop detection (we've seen this grid before)
+                    if grid_hash in seen_grids:
+                        should_submit = True
+                    # Condition 2: Late episode panic
+                    elif step > self.max_steps * 0.8 and self._rng.random() < 0.2:
+                        should_submit = True
+
+                if should_submit:
+                    action = submit_action
+                else:
+                    action = self._choose_action(obs)
+                    seen_grids.add(obs.grid.tobytes())
+
                 before = obs
                 result = adapter.step(action)
                 writer.write_transition(step=step, before=before, result=result)
