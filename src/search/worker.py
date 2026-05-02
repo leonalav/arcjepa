@@ -18,6 +18,12 @@ def mine_game_worker(args: dict):
     algorithm = args.get("algorithm", "random_legal")
     max_steps = int(args.get("max_steps", 100))
     seed = int(args.get("seed", 0))
+
+    import random
+    import numpy as np
+    random.seed(seed)
+    np.random.seed(seed % (2**32 - 1))
+
     out_dir = Path(args["out_dir"])
     exploration_rate = float(args.get("exploration_rate", 0.15))
     uct_simulations = int(args.get("uct_simulations", 200))
