@@ -192,21 +192,11 @@ def format_action_sequence(actions: List[Tuple[int, int, int]]) -> str:
     Returns:
         Formatted string
     """
-    action_names = {
-        0: "NONE",
-        1: "ACTION1",
-        2: "ACTION2",
-        3: "ACTION3",
-        4: "ACTION4",
-        5: "ACTION5",
-        6: "ACTION6",
-        7: "ACTION7",
-        8: "SUBMIT",
-    }
+    from src.data.arc_schema import action_name
 
     lines = []
     for i, (action, x, y) in enumerate(actions):
-        name = action_names.get(action, f"UNKNOWN({action})")
+        name = action_name(action)
         lines.append(f"Step {i+1}: {name} at ({x}, {y})")
 
     return "\n".join(lines)

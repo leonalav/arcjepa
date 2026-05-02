@@ -8,91 +8,202 @@ from typing import List, Dict, Any, Optional
 import random
 from datasets import load_dataset
 
-# Discover project root (3 levels up from src/data/dataset.py)
 PROJECT_ROOT = Path(__file__).parent.parent.parent.resolve()
 
-# Official ARC-AGI imports
 import arc_agi
 from torch.utils.data import Dataset
 from arcengine import GameAction, GameState
 
-# =====================================================================
-# MODULE-LEVEL PARSING FUNCTIONS
-# Extracted from the class to allow fast pickling across 96 CPUs.
-# =====================================================================
+from .arc_schema import (
+    DEFAULT_NUM_ACTIONS,
+    action_uses_coordinates,
+    encode_available_actions,
+    extract_first,
+    make_coord_mask,
+    parse_action_name,
+    stable_game_family_id,
+    stable_game_id,
+)
+
 
 def _extract_grid_static(obj):
     if isinstance(obj, list) and len(obj) > 0 and isinstance(obj[0], list):
         return obj
     if isinstance(obj, dict):
-        for k in ['grid', 'frame', 'board', 'state', 'observation']:
+        for k in ['grid', 'frame', 'board', 'state', 'observation', 'obs']:
             if k in obj:
                 res = _extract_grid_static(obj[k])
-                if res is not None: return res
+                if res is not None:
+                    return res
         for v in obj.values():
             res = _extract_grid_static(v)
-            if res is not None: return res
+            if res is not None:
+                return res
     return None
 
-def _preprocess_frame_static(frame_data: Dict[str, Any], max_grid_size: int) -> Dict[str, Any]:
+
+def _extract_game_id(frame_data: Dict[str, Any], file_path: Optional[str] = None) -> Optional[str]:
+    game_id = extract_first(frame_data, ['game_id', 'gameId', 'environment_id', 'env_id', 'task_id'])
+    if game_id is not None:
+        return str(game_id)
+    meta = frame_data.get('metadata') or frame_data.get('meta') or {}
+    game_id = extract_first(meta, ['game_id', 'gameId', 'environment_id', 'env_id', 'task_id'])
+    if game_id is not None:
+        return str(game_id)
+    if file_path:
+        stem = Path(file_path).stem
+        parts = stem.split('_', 1)[0]
+        if '-' in parts:
+            return parts
+    return None
+
+
+def _extract_action_data(frame_data: Dict[str, Any]) -> Any:
+    return extract_first(frame_data, ['action_input', 'action', 'action_data', 'input'], {})
+
+
+def _extract_available_actions(frame_data: Dict[str, Any]) -> Any:
+    raw = extract_first(frame_data, ['available_actions', 'availableActions', 'valid_actions', 'validActions'])
+    if raw is not None:
+        return raw
+    obs = frame_data.get('observation') or frame_data.get('obs') or frame_data.get('state') or {}
+    if isinstance(obs, dict):
+        return extract_first(obs, ['available_actions', 'availableActions', 'valid_actions', 'validActions'])
+    return None
+
+
+def _terminal_success(frame_data: Dict[str, Any]) -> tuple[bool, bool]:
+    state = extract_first(frame_data, ['terminal_state', 'state', 'status', 'game_state'])
+    terminal = bool(extract_first(frame_data, ['terminal', 'done', 'is_terminal'], False))
+    success = bool(extract_first(frame_data, ['success', 'win', 'won'], False))
+    if hasattr(state, 'name'):
+        state = state.name
+    if state is not None:
+        state_text = str(state).upper()
+        terminal = terminal or state_text in {'WIN', 'GAME_OVER', 'LOSE', 'LOSS', 'DONE', 'TERMINAL'}
+        success = success or state_text == 'WIN'
+    return terminal, success
+
+
+def _score_value(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _preprocess_frame_static(
+    frame_data: Dict[str, Any],
+    max_grid_size: int,
+    file_path: Optional[str] = None,
+    num_actions: int = DEFAULT_NUM_ACTIONS,
+    max_games: int = 4096,
+    max_game_families: int = 512,
+) -> Dict[str, Any]:
     grid_data = _extract_grid_static(frame_data) or []
     grid = np.array(grid_data, dtype=np.int64)
-    
-    while grid.ndim > 2: grid = grid[0]
-    if grid.ndim < 2 or grid.size == 0: grid = np.zeros((1, 1), dtype=np.int64)
-        
+
+    while grid.ndim > 2:
+        grid = grid[0]
+    if grid.ndim < 2 or grid.size == 0:
+        grid = np.zeros((1, 1), dtype=np.int64)
+
+    if grid.min(initial=0) < 0 or grid.max(initial=0) > 15:
+        raise ValueError(f"ARC grid colors must be in [0, 15], got [{grid.min()}, {grid.max()}]")
+
     h, w = grid.shape
     safe_h, safe_w = min(h, max_grid_size), min(w, max_grid_size)
-    
     padded_grid = np.zeros((max_grid_size, max_grid_size), dtype=np.int64)
     padded_grid[:safe_h, :safe_w] = grid[:safe_h, :safe_w]
-    
-    action_data = frame_data.get('action_input') or {}
+
+    action_data = _extract_action_data(frame_data)
     if isinstance(action_data, str):
         action_type = action_data
         ax, ay = 0, 0
-    else:
-        action_type = action_data.get('action', 'NONE')
+    elif isinstance(action_data, dict):
+        action_type = action_data.get('action', action_data.get('type', 'NONE'))
         ax = max(0, min(int(action_data.get('x', 0)), max_grid_size - 1))
         ay = max(0, min(int(action_data.get('y', 0)), max_grid_size - 1))
-        
-    action_idx = 0
-    if action_type.startswith('ACTION') and action_type[6:].isdigit():
-        action_idx = int(action_type[6:])
-    elif action_type == 'SUBMIT':
-        action_idx = 8
-        
+    else:
+        action_type = action_data
+        ax, ay = 0, 0
+
+    action_idx = parse_action_name(action_type, num_actions=num_actions, strict=False)
+    available_mask = encode_available_actions(_extract_available_actions(frame_data), num_actions=num_actions)
+    if action_idx > 0 and not available_mask[action_idx]:
+        available_mask[action_idx] = True
+
+    game_id = _extract_game_id(frame_data, file_path)
+    terminal, success = _terminal_success(frame_data)
+    score = _score_value(extract_first(frame_data, ['score', 'reward', 'rhae', 'RHAE'], 0.0))
+    step_index = int(extract_first(frame_data, ['step', 'step_index', 'timestep', 'frame_index'], 0) or 0)
+
     return {
         'grid': torch.from_numpy(padded_grid),
         'action_type': action_idx,
         'x': ax,
-        'y': ay
+        'y': ay,
+        'available_actions_mask': available_mask,
+        'coord_mask': action_uses_coordinates(action_idx),
+        'game_id': stable_game_id(game_id, max_games),
+        'game_family': stable_game_family_id(game_id, max_game_families),
+        'terminal': terminal,
+        'success': success,
+        'score': score,
+        'step_index': step_index,
     }
 
+
 def _process_single_file(args):
-    """Worker function executed independently on the 96 CPUs"""
-    file_path, window_size, stride, max_grid_size, filter_noops = args
-    grids, actions, xs, ys = [], [], [], []
-    
+    file_path, window_size, stride, max_grid_size, filter_noops, num_actions, max_games, max_game_families = args
+    rows = {k: [] for k in [
+        'grids', 'actions', 'xs', 'ys', 'available_masks', 'coord_masks', 'game_ids',
+        'game_families', 'terminals', 'successes', 'scores', 'step_indices'
+    ]}
+
     with open(file_path, 'r') as f:
         for line in f:
-            if not line.strip(): continue
+            if not line.strip():
+                continue
             frame_data = json.loads(line)
-            processed = _preprocess_frame_static(frame_data, max_grid_size)
-            grids.append(processed['grid'].to(torch.uint8))
-            actions.append(processed['action_type'])
-            xs.append(processed['x'])
-            ys.append(processed['y'])
-            
-    traj_len = len(grids)
+            processed = _preprocess_frame_static(
+                frame_data,
+                max_grid_size,
+                file_path=file_path,
+                num_actions=num_actions,
+                max_games=max_games,
+                max_game_families=max_game_families,
+            )
+            rows['grids'].append(processed['grid'].to(torch.uint8))
+            rows['actions'].append(processed['action_type'])
+            rows['xs'].append(processed['x'])
+            rows['ys'].append(processed['y'])
+            rows['available_masks'].append(processed['available_actions_mask'])
+            rows['coord_masks'].append(processed['coord_mask'])
+            rows['game_ids'].append(processed['game_id'])
+            rows['game_families'].append(processed['game_family'])
+            rows['terminals'].append(processed['terminal'])
+            rows['successes'].append(processed['success'])
+            rows['scores'].append(processed['score'])
+            rows['step_indices'].append(processed['step_index'])
+
+    traj_len = len(rows['grids'])
     if traj_len < 2:
         return None
 
-    grids_tensor = torch.stack(grids)
-    actions_tensor = torch.tensor(actions, dtype=torch.uint8)
-    xs_tensor = torch.tensor(xs, dtype=torch.uint8)
-    ys_tensor = torch.tensor(ys, dtype=torch.uint8)
-    
+    grids_tensor = torch.stack(rows['grids'])
+    actions_tensor = torch.tensor(rows['actions'], dtype=torch.long)
+    xs_tensor = torch.tensor(rows['xs'], dtype=torch.long)
+    ys_tensor = torch.tensor(rows['ys'], dtype=torch.long)
+    available_tensor = torch.stack(rows['available_masks']).bool()
+    coord_tensor = torch.tensor(rows['coord_masks'], dtype=torch.bool)
+    game_ids_tensor = torch.tensor(rows['game_ids'], dtype=torch.long)
+    game_families_tensor = torch.tensor(rows['game_families'], dtype=torch.long)
+    terminals_tensor = torch.tensor(rows['terminals'], dtype=torch.bool)
+    successes_tensor = torch.tensor(rows['successes'], dtype=torch.bool)
+    scores_tensor = torch.tensor(rows['scores'], dtype=torch.float32)
+    step_indices_tensor = torch.tensor(rows['step_indices'], dtype=torch.long)
+
     valid_starts = []
     for i in range(0, traj_len - window_size, stride):
         if filter_noops:
@@ -100,24 +211,27 @@ def _process_single_file(args):
             if torch.all(chunk_grids == chunk_grids[0]):
                 continue
         valid_starts.append(i)
-        
-    return grids_tensor, actions_tensor, xs_tensor, ys_tensor, valid_starts
+
+    return (
+        grids_tensor, actions_tensor, xs_tensor, ys_tensor, available_tensor, coord_tensor,
+        game_ids_tensor, game_families_tensor, terminals_tensor, successes_tensor,
+        scores_tensor, step_indices_tensor, valid_starts
+    )
+
 
 class ARCTrajectoryDataset(Dataset):
-    """
-    Dataset for ARC-AGI-3 game trajectories.
-    Parses JSONL recordings generated by the official ARC-AGI Toolkit and 
-    provides sliding window chunks of (state, action) pairs.
-    """
     def __init__(
         self,
         recording_files: List[str],
         window_size: int = 24,
         stride: int = 4,
-        max_grid_size: int = 64,  # Updated to 64 based on ARC-AGI-3 docs
+        max_grid_size: int = 64,
         multistep_k: int = 1,
         compute_temporal_masks: bool = False,
-        filter_noops: bool = False
+        filter_noops: bool = False,
+        num_actions: int = DEFAULT_NUM_ACTIONS,
+        max_games: int = 4096,
+        max_game_families: int = 512,
     ):
         self.window_size = window_size
         self.stride = stride
@@ -125,44 +239,32 @@ class ARCTrajectoryDataset(Dataset):
         self.multistep_k = multistep_k
         self.compute_temporal_masks = compute_temporal_masks
         self.filter_noops = filter_noops
+        self.num_actions = num_actions
+        self.max_games = max_games
+        self.max_game_families = max_game_families
         self.chunks = []
-        self.trajectories_grids = []
-        self.trajectories_actions = []
-        self.trajectories_xs = []
-        self.trajectories_ys = []
-
+        self.trajectories = []
         self._load_recordings(recording_files)
 
     def _load_recordings(self, recording_files: List[str]):
-        # XLA spawns 8 processes. We cap max_workers at 12 per process.
-        # 12 workers * 8 XLA processes = 96 CPUs perfectly saturated.
         max_workers = min(12, multiprocessing.cpu_count())
-        
         args_list = [
-            (f, self.window_size, self.stride, self.max_grid_size, self.filter_noops) 
+            (f, self.window_size, self.stride, self.max_grid_size, self.filter_noops,
+             self.num_actions, self.max_games, self.max_game_families)
             for f in recording_files
         ]
-        
-        # CRITICAL: Must use 'spawn' to prevent libtpu from crashing during forks
         ctx = multiprocessing.get_context('spawn')
-        
         with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as executor:
-            # map guarantees order is preserved if needed, though chunks are shuffled later
             results = list(executor.map(_process_single_file, args_list))
-            
+
         for res in results:
             if res is None:
                 continue
-            grids_t, actions_t, xs_t, ys_t, valid_starts = res
-            
-            traj_idx = len(self.trajectories_grids)
+            valid_starts = res[-1]
+            traj_idx = len(self.trajectories)
             for start_idx in valid_starts:
                 self.chunks.append((traj_idx, start_idx))
-                
-            self.trajectories_grids.append(grids_t)
-            self.trajectories_actions.append(actions_t)
-            self.trajectories_xs.append(xs_t)
-            self.trajectories_ys.append(ys_t)
+            self.trajectories.append(res[:-1])
 
     def __len__(self):
         return len(self.chunks)
@@ -170,227 +272,210 @@ class ARCTrajectoryDataset(Dataset):
     def __getitem__(self, idx):
         traj_idx, start_idx = self.chunks[idx]
         end_idx = start_idx + self.window_size + 1
-        
-        # Extract and convert back to long for embedding layers
-        grids = self.trajectories_grids[traj_idx][start_idx:end_idx].long()
-        actions = self.trajectories_actions[traj_idx][start_idx:end_idx-1].long()
-        xs = self.trajectories_xs[traj_idx][start_idx:end_idx-1].long()
-        ys = self.trajectories_ys[traj_idx][start_idx:end_idx-1].long()
+        (
+            grids, actions, xs, ys, available, coord_masks, game_ids, game_families,
+            terminals, successes, scores, step_indices
+        ) = [t[start_idx:end_idx] for t in self.trajectories[traj_idx]]
 
-        # Input: steps 0 to T-1 (grids and actions)
-        # Target: steps 1 to T (grids for latent prediction)
+        state_changed_mask = self._compute_temporal_mask(grids[:-1].long(), grids[1:].long())
+        seq_mask = torch.ones(self.window_size, dtype=torch.float32)
+        efficiency = self._efficiency_targets(successes[:-1], step_indices[:-1])
+
         result = {
-            'states': grids[:-1],          # [T, 64, 64]
-            'actions': actions,            # [T]
-            'coords_x': xs,                # [T]
-            'coords_y': ys,                # [T]
-            'target_states': grids[1:],    # [T, 64, 64]
-            'final_state': grids[-1]       # [64, 64] (for reconstruction loss)
+            'states': grids[:-1].long(),
+            'actions': actions[:-1].long(),
+            'coords_x': xs[:-1].long(),
+            'coords_y': ys[:-1].long(),
+            'target_states': grids[1:].long(),
+            'final_state': grids[-1].long(),
+            'available_actions_mask': available[:-1].bool(),
+            'coord_mask': coord_masks[:-1].bool(),
+            'game_id': game_ids[:-1].long(),
+            'game_family': game_families[:-1].long(),
+            'terminal': terminals[:-1].float(),
+            'success': successes[:-1].float(),
+            'score': scores[:-1].float(),
+            'step_index': step_indices[:-1].long(),
+            'efficiency_target': efficiency.float(),
+            'seq_mask': seq_mask,
+            'state_changed_mask': state_changed_mask.float(),
         }
-
-        # Compute temporal masks if requested
         if self.compute_temporal_masks:
-            temporal_mask = self._compute_temporal_mask(grids[:-1], grids[1:])
-            result['temporal_mask'] = temporal_mask
-
+            result['temporal_mask'] = state_changed_mask.float()
         return result
 
+    def _efficiency_targets(self, successes: torch.Tensor, step_indices: torch.Tensor) -> torch.Tensor:
+        steps = step_indices.float().clamp_min(0.0)
+        return successes.float() / (steps + 1.0)
+
     def _compute_temporal_mask(self, states: torch.Tensor, target_states: torch.Tensor) -> torch.Tensor:
-        """
-        Compute binary mask indicating which pixels changed between consecutive states.
-
-        Args:
-            states: [T, H, W] input states
-            target_states: [T, H, W] target states
-
-        Returns:
-            mask: [T, H, W] binary mask (1 = changed, 0 = unchanged)
-        """
         return (states != target_states).float()
 
     def validate_arc_compliance(self):
-        """Validate dataset respects ARC-AGI-3 specifications"""
         print(f"Validating {len(self.chunks)} chunks for ARC-AGI-3 compliance...")
-
         for chunk_idx, (traj_idx, start_idx) in enumerate(self.chunks):
             end_idx = start_idx + self.window_size + 1
-            grids = self.trajectories_grids[traj_idx][start_idx:end_idx]
-            actions = self.trajectories_actions[traj_idx][start_idx:end_idx-1]
-            xs = self.trajectories_xs[traj_idx][start_idx:end_idx-1]
-            ys = self.trajectories_ys[traj_idx][start_idx:end_idx-1]
-            
-            for step_idx in range(len(grids)):
-                grid = grids[step_idx]
+            grids, actions, xs, ys, available, *_ = [t[start_idx:end_idx] for t in self.trajectories[traj_idx]]
+            for step_idx, grid in enumerate(grids):
+                assert grid.shape == (64, 64), f"Chunk {chunk_idx}, Step {step_idx}: Invalid grid shape {grid.shape}"
+                assert grid.min() >= 0 and grid.max() <= 15, f"Chunk {chunk_idx}, Step {step_idx}: Invalid color range [{grid.min()}, {grid.max()}]"
+                if step_idx < len(actions) - 1:
+                    action = int(actions[step_idx])
+                    assert 0 <= action < self.num_actions, f"Chunk {chunk_idx}, Step {step_idx}: Invalid action type {action}"
+                    assert 0 <= xs[step_idx] < 64 and 0 <= ys[step_idx] < 64, f"Chunk {chunk_idx}, Step {step_idx}: Invalid coords ({xs[step_idx]}, {ys[step_idx]})"
+                    assert available[step_idx].shape[0] == self.num_actions, f"Chunk {chunk_idx}, Step {step_idx}: Invalid action mask shape"
+                    assert action == 0 or bool(available[step_idx, action]), f"Chunk {chunk_idx}, Step {step_idx}: Target action {action} unavailable"
+        print(f"Dataset validation passed: {len(self.chunks)} chunks comply with ARC-AGI-3 specs")
 
-                # Check grid size
-                assert grid.shape == (64, 64), \
-                    f"Chunk {chunk_idx}, Step {step_idx}: Invalid grid shape {grid.shape}"
-
-                # Check color range
-                assert grid.min() >= 0 and grid.max() <= 15, \
-                    f"Chunk {chunk_idx}, Step {step_idx}: Invalid color range [{grid.min()}, {grid.max()}]"
-
-                if step_idx < len(actions):
-                    # Check action type
-                    assert 0 <= actions[step_idx] <= 8, \
-                        f"Chunk {chunk_idx}, Step {step_idx}: Invalid action type {actions[step_idx]}"
-
-                    # Check coordinates
-                    assert 0 <= xs[step_idx] < 64 and 0 <= ys[step_idx] < 64, \
-                        f"Chunk {chunk_idx}, Step {step_idx}: Invalid coords ({xs[step_idx]}, {ys[step_idx]})"
-
-        print(f"✓ Dataset validation passed: {len(self.chunks)} chunks comply with ARC-AGI-3 specs")
 
 class FastHFARCDataset(Dataset):
-    """
-    Lightning-fast dataset that reads memory-mapped Arrow files from Hugging Face.
-    Provides the exact pre-sliced dictionary format expected by the GDN World Model.
-    
-    CRITICAL for XLA/TPU: Enforces a fixed sequence length (max_seq_len) so that
-    every batch produces identical tensor shapes. XLA compiles ONE graph per unique
-    shape — variable lengths would cause repeated recompilations and OOM.
-    """
-    def __init__(self, hf_repo_id: str, split: str = "train", 
-                 compute_temporal_masks: bool = False,
-                 max_seq_len: int = 64):
+    def __init__(
+        self,
+        hf_repo_id: str,
+        split: str = "train",
+        compute_temporal_masks: bool = False,
+        max_seq_len: int = 64,
+        num_actions: int = DEFAULT_NUM_ACTIONS,
+        max_games: int = 4096,
+        max_game_families: int = 512,
+    ):
         super().__init__()
         self.hf_ds = load_dataset(hf_repo_id, split=split)
         self.compute_temporal_masks = compute_temporal_masks
-        self.max_seq_len = max_seq_len  # Fixed T for XLA static shapes
-        
+        self.max_seq_len = max_seq_len
+        self.num_actions = num_actions
+        self.max_games = max_games
+        self.max_game_families = max_game_families
+
     def __len__(self):
         return len(self.hf_ds)
 
     def _pad_or_window(self, tensor: torch.Tensor, target_len: int) -> torch.Tensor:
-        """Pad short sequences or randomly window long sequences to target_len."""
         current_len = tensor.shape[0]
         if current_len == target_len:
             return tensor
-        elif current_len > target_len:
-            # Random window for data augmentation + length control
-            max_start = current_len - target_len
-            start = random.randint(0, max_start)
+        if current_len > target_len:
+            start = random.randint(0, current_len - target_len)
             return tensor[start:start + target_len]
-        else:
-            # Pad by repeating the last frame/value
-            pad_shape = list(tensor.shape)
-            pad_shape[0] = target_len - current_len
-            padding = tensor[-1:].expand(pad_shape)
-            return torch.cat([tensor, padding], dim=0)
+        pad_shape = list(tensor.shape)
+        pad_shape[0] = target_len - current_len
+        padding = tensor[-1:].expand(pad_shape)
+        return torch.cat([tensor, padding], dim=0)
+
+    def _item_tensor(self, item: Dict[str, Any], key: str, default: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        if key in item and item[key] is not None:
+            return torch.tensor(item[key], dtype=dtype)
+        return default.to(dtype=dtype)
 
     def __getitem__(self, idx):
         item = self.hf_ds[idx]
-        
+        T = self.max_seq_len
         states_raw = torch.tensor(item['states'], dtype=torch.long)
         actions_raw = torch.tensor(item['actions'], dtype=torch.long)
         coords_x_raw = torch.tensor(item['coords_x'], dtype=torch.long)
         coords_y_raw = torch.tensor(item['coords_y'], dtype=torch.long)
         target_states_raw = torch.tensor(item['target_states'], dtype=torch.long)
-        
-        T = self.max_seq_len
+
+        raw_len = states_raw.shape[0]
         states = self._pad_or_window(states_raw, T)
         actions = self._pad_or_window(actions_raw, T)
         coords_x = self._pad_or_window(coords_x_raw, T)
         coords_y = self._pad_or_window(coords_y_raw, T)
         target_states = self._pad_or_window(target_states_raw, T)
-        
-        final_state = target_states[-1]
-        
-        # THE TRUE FIX: Only keep steps where the grid ACTUALLY changed.
-        # If the grid is identical across time (a padded no-op), mask it out.
-        # We flatten the spatial dims to check if all pixels are identical.
-        s_flat = states.reshape(T, -1)
-        t_flat = target_states.reshape(T, -1)
-        
-        # 1.0 if there is any difference, 0.0 if perfectly identical
-        seq_mask = (s_flat != t_flat).any(dim=1).float()
-        
+        valid_len = min(raw_len, T)
+        seq_mask = torch.zeros(T, dtype=torch.float32)
+        seq_mask[:valid_len] = 1.0
+
+        available_default = torch.ones(raw_len, self.num_actions, dtype=torch.bool)
+        available_default[:, 0] = False
+        available_raw = self._item_tensor(item, 'available_actions_mask', available_default, torch.bool)
+        available = self._pad_or_window(available_raw, T).bool()
+        action_positions = actions.clamp(0, self.num_actions - 1).unsqueeze(-1)
+        available.scatter_(1, action_positions, True)
+
+        coord_default = make_coord_mask(actions_raw)
+        coord_mask = self._pad_or_window(self._item_tensor(item, 'coord_mask', coord_default, torch.bool), T).bool()
+        game_id = self._pad_or_window(self._item_tensor(item, 'game_id', torch.zeros(raw_len, dtype=torch.long), torch.long), T).long()
+        game_family = self._pad_or_window(self._item_tensor(item, 'game_family', torch.zeros(raw_len, dtype=torch.long), torch.long), T).long()
+        terminal = self._pad_or_window(self._item_tensor(item, 'terminal', torch.zeros(raw_len), torch.float32), T).float()
+        success = self._pad_or_window(self._item_tensor(item, 'success', torch.zeros(raw_len), torch.float32), T).float()
+        score = self._pad_or_window(self._item_tensor(item, 'score', torch.zeros(raw_len), torch.float32), T).float()
+        step_index = self._pad_or_window(self._item_tensor(item, 'step_index', torch.arange(raw_len), torch.long), T).long()
+        efficiency = self._pad_or_window(self._item_tensor(item, 'efficiency_target', success / (step_index.float() + 1.0), torch.float32), T).float()
+        state_changed_mask = (states != target_states).float()
+
         result = {
             'states': states,
             'actions': actions,
             'coords_x': coords_x,
             'coords_y': coords_y,
             'target_states': target_states,
-            'final_state': final_state,
-            'seq_mask': seq_mask  # Passes our strict semantic mask to loss.py
+            'final_state': target_states[-1],
+            'available_actions_mask': available,
+            'coord_mask': coord_mask,
+            'game_id': game_id,
+            'game_family': game_family,
+            'terminal': terminal,
+            'success': success,
+            'score': score,
+            'step_index': step_index,
+            'efficiency_target': efficiency,
+            'seq_mask': seq_mask,
+            'state_changed_mask': state_changed_mask,
         }
-        
         if self.compute_temporal_masks:
-            result['temporal_mask'] = (states != target_states).float()
-            
+            result['temporal_mask'] = state_changed_mask
         return result
+
 
 def create_mock_trajectory(
     output_dir: str,
     num_trajectories: int = 1000,
     min_state_changes: int = 5,
     min_fg_ratio: float = 0.1,
-    max_attempts: int = 5000
+    max_attempts: int = 5000,
+    split_seed: int = 0,
 ):
-    """
-    Generate meaningful ARC trajectories using heuristic policy.
-
-    Instead of random actions, uses pattern detection to create trajectories
-    with causal structure and meaningful state transitions.
-
-    Args:
-        output_dir: Directory to save recordings
-        num_trajectories: Target number of valid trajectories
-        min_state_changes: Minimum state changes to keep trajectory
-        min_fg_ratio: Minimum foreground ratio to keep trajectory
-        max_attempts: Maximum generation attempts
-    """
     from .heuristic_policy import ARCHeuristicPolicy
     import shutil
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
-
-    # Define a local directory for ARC environments
     env_dir = PROJECT_ROOT / "data" / "arc_environments"
     env_dir.mkdir(parents=True, exist_ok=True)
-
-    # Instantiate the official Arcade entry point
     arc = arc_agi.Arcade(environments_dir=str(env_dir))
 
-    # Explicitly defined public ARC-AGI-3 games
     game_ids = [
-        "vc33-5430563c", "sp80-589a99af", "re86-8af5384d", "m0r0-492f87ba", 
-        "wa30-ee6fef47", "r11l-495a7899", "tu93-0768757b", "ka59-38d34dbb", 
-        "sc25-635fd71a", "ft09-0d8bbf25", "ls20-9607627b", "ar25-0c556536", 
-        "lf52-271a04aa", "g50t-5849a774", "su15-1944f8ab", "tn36-ef4dde99", 
-        "sb26-7fbdac44", "cn04-2fe56bfb", "lp85-305b61c3", "s5i5-18d95033", 
-        "sk48-d8078629", "cd82-fb555c5d", "tr87-cd924810", "bp35-0a0ad940", 
+        "vc33-5430563c", "sp80-589a99af", "re86-8af5384d", "m0r0-492f87ba",
+        "wa30-ee6fef47", "r11l-495a7899", "tu93-0768757b", "ka59-38d34dbb",
+        "sc25-635fd71a", "ft09-0d8bbf25", "ls20-9607627b", "ar25-0c556536",
+        "lf52-271a04aa", "g50t-5849a774", "su15-1944f8ab", "tn36-ef4dde99",
+        "sb26-7fbdac44", "cn04-2fe56bfb", "lp85-305b61c3", "s5i5-18d95033",
+        "sk48-d8078629", "cd82-fb555c5d", "tr87-cd924810", "bp35-0a0ad940",
         "dc22-fdcac232"
     ]
-
-    # 20/5 Train/Validation Split
-    import random
-    random.shuffle(game_ids)
-    val_split_size = min(5, len(game_ids) // 5) # Hold out up to 5 games
+    rng = random.Random(split_seed)
+    rng.shuffle(game_ids)
+    val_split_size = min(5, len(game_ids) // 5)
     val_games = set(game_ids[:val_split_size])
-    train_games = set(game_ids[val_split_size:])
 
-    print(f"Dataset Split: {len(train_games)} Train games, {len(val_games)} Validation games")
-    print(f"Held-out Validation Set: {val_games}")
-
-    # Initialize heuristic policy
     policy = ARCHeuristicPolicy(exploration_rate=0.2)
-
     successful = 0
     attempts = 0
-
-    print(f"Generating {num_trajectories} trajectories with heuristic policy...")
-    print(f"Filters: min_changes={min_state_changes}, min_fg={min_fg_ratio}")
+    valid_action_count = 0
+    total_action_count = 0
+    terminal_count = 0
+    win_count = 0
 
     def get_grid(obs):
         grid_data = None
-        if hasattr(obs, 'grid'): grid_data = obs.grid
-        elif hasattr(obs, 'frame'): grid_data = obs.frame
-        elif hasattr(obs, 'board'): grid_data = obs.board
-        
+        if hasattr(obs, 'grid'):
+            grid_data = obs.grid
+        elif hasattr(obs, 'frame'):
+            grid_data = obs.frame
+        elif hasattr(obs, 'board'):
+            grid_data = obs.board
         if grid_data is not None:
             arr = np.array(grid_data, dtype=np.int64)
-            # Force exactly 2D to prevent unpacking errors (e.g., h, w = grid.shape)
             while arr.ndim > 2:
                 arr = arr[0]
             if arr.ndim < 2:
@@ -398,107 +483,83 @@ def create_mock_trajectory(
             return arr
         return None
 
+    def get_available(obs):
+        for name in ('available_actions', 'availableActions', 'valid_actions', 'validActions'):
+            if hasattr(obs, name):
+                return getattr(obs, name)
+        return None
+
     while successful < num_trajectories and attempts < max_attempts:
         game_id = game_ids[attempts % len(game_ids)]
-
         try:
             env = arc.make(game_id, save_recording=True)
             obs = env.reset()
             current_grid = get_grid(obs)
-
             if obs is None or current_grid is None:
                 attempts += 1
                 continue
-
-            # Track trajectory quality
             state_changes = 0
             prev_grid = current_grid.copy()
             max_fg_ratio = 0.0
             step = 0
             max_steps = 100
-
             while step < max_steps:
                 if obs is None or current_grid is None:
                     break
-
-                # Select action using heuristic policy
-                action_enum, x, y = policy.select_action(current_grid, step)
-
-                # Execute action
+                available = get_available(obs)
+                action_enum, x, y = policy.select_action(current_grid, step, available_actions=available, game_id=game_id)
+                total_action_count += 1
+                if available is None or parse_action_name(action_enum) in set(encode_available_actions(available).nonzero(as_tuple=False).flatten().tolist()):
+                    valid_action_count += 1
                 if action_enum == GameAction.ACTION6:
                     obs = env.step(action_enum, data={"x": x, "y": y})
                 else:
                     obs = env.step(action_enum)
-
                 current_grid = get_grid(obs)
-
-                # Track state changes
                 if obs and current_grid is not None:
                     if not np.array_equal(current_grid, prev_grid):
                         state_changes += 1
-
-                    # Track foreground ratio
-                    fg_ratio = np.mean(current_grid != 0)
-                    max_fg_ratio = max(max_fg_ratio, fg_ratio)
-
+                    max_fg_ratio = max(max_fg_ratio, np.mean(current_grid != 0))
                     prev_grid = current_grid.copy()
-
-                # Check termination
                 if obs and obs.state in [GameState.WIN, GameState.GAME_OVER]:
+                    terminal_count += 1
+                    if obs.state == GameState.WIN:
+                        win_count += 1
                     break
-
                 step += 1
-
-            # Filter trajectory
             if state_changes >= min_state_changes and max_fg_ratio >= min_fg_ratio:
                 successful += 1
-
                 if successful % 100 == 0:
                     print(f"Progress: {successful}/{num_trajectories} valid trajectories")
                     print(f"  Last trajectory: {state_changes} changes, {max_fg_ratio:.3f} fg_ratio")
-
         except Exception as e:
             print(f"Warning: Failed to generate trajectory {attempts}: {e}")
-
         attempts += 1
 
-    # Move recordings to output directory and split them into Train/Val
     local_recordings = Path("recordings")
     if local_recordings.exists():
         train_dir = Path(output_dir) / "train"
         val_dir = Path(output_dir) / "val"
         train_dir.mkdir(parents=True, exist_ok=True)
         val_dir.mkdir(parents=True, exist_ok=True)
-
         moved_train = 0
         moved_val = 0
-
         for jsonl_file in local_recordings.glob("**/*.jsonl"):
-            # Identify which full game ID this file belongs to
-            file_game_id = None
-            for gid in game_ids:
-                if jsonl_file.name.startswith(gid):
-                    file_game_id = gid
-                    break
-            
+            file_game_id = next((gid for gid in game_ids if jsonl_file.name.startswith(gid)), None)
             target_dir = val_dir if file_game_id in val_games else train_dir
-            
-            # Append the unique counter to prevent overwriting
             new_name = f"{jsonl_file.stem}_{moved_train + moved_val}.jsonl"
             shutil.copy(jsonl_file, target_dir / new_name)
-            
             if file_game_id in val_games:
                 moved_val += 1
             else:
                 moved_train += 1
+        print(f"\nSuccessfully split dataset: {moved_train} train, {moved_val} val")
 
-        print(f"\nSuccessfully split dataset:")
-        print(f"  Moved {moved_train} recordings to {train_dir}")
-        print(f"  Moved {moved_val} recordings to {val_dir}")
-
+    valid_rate = valid_action_count / max(1, total_action_count)
     print(f"\nGeneration complete:")
     print(f"  Valid trajectories: {successful}/{num_trajectories}")
     print(f"  Total attempts: {attempts}")
-    print(f"  Success rate: {successful/attempts*100:.1f}%")
-
+    print(f"  Valid action rate: {valid_rate:.3f}")
+    print(f"  Terminal rate: {terminal_count / max(1, attempts):.3f}")
+    print(f"  Win rate: {win_count / max(1, attempts):.3f}")
     return successful

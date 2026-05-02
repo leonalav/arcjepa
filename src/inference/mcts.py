@@ -12,6 +12,8 @@ import torch.nn as nn
 from typing import Optional, List, Tuple, Dict, Any
 import random
 
+from src.data.arc_schema import action_uses_coordinates
+
 from .node import MCTSNode
 from .config import MCTSConfig
 from .utils import grid_accuracy
@@ -189,64 +191,46 @@ class LatentMCTS:
         return node, depth
 
     def _expand(self, node: MCTSNode, top_k: int = 5) -> Optional[MCTSNode]:
-        """
-        Phase 2: Expansion (AlphaZero Top-K style).
-        Bypasses root heuristics and extracts the Top-K actions directly from the Latent Policy Head.
-        """
         import torch.nn.functional as F
-        
-        # 1. Dynamically generate Top-K policy priors for the CURRENT state
+
         with torch.no_grad():
-            logits = self.policy_head(node.s_t)  # [1, 9 + 64 + 64]
-            a_probs = F.softmax(logits[:, :9], dim=1).squeeze(0)
-            x_probs = F.softmax(logits[:, 9:73], dim=1).squeeze(0)
-            y_probs = F.softmax(logits[:, 73:137], dim=1).squeeze(0)
+            if hasattr(self.policy_head, 'components'):
+                action_logits, x_logits, y_logits = self.policy_head.components(node.s_t)
+            else:
+                logits = self.policy_head(node.s_t)
+                num_actions = getattr(self.config, 'num_actions', 9)
+                action_logits = logits[:, :num_actions]
+                x_logits = logits[:, num_actions:num_actions + 64]
+                y_logits = logits[:, num_actions + 64:num_actions + 128]
 
-            # Outer product to get joint distribution [9, 64, 64]
-            # joint_probs[a, x, y] = P(a) * P(x) * P(y)
-            joint_probs = a_probs.view(9, 1, 1) * x_probs.view(1, 64, 1) * y_probs.view(1, 1, 64)
-            
-            # Flatten to find Top-K absolute best moves globally
-            flat_probs = joint_probs.flatten()
-            top_probs, top_indices = torch.topk(flat_probs, top_k)
+            valid_actions = self.config.actions_from_mask(None)
+            valid_mask = torch.zeros_like(action_logits, dtype=torch.bool)
+            for action in valid_actions:
+                if 0 <= action < valid_mask.shape[-1]:
+                    valid_mask[:, action] = True
+            action_logits = action_logits.masked_fill(~valid_mask, torch.finfo(action_logits.dtype).min)
+            a_probs = F.softmax(action_logits, dim=1).squeeze(0)
+            x_probs = F.softmax(x_logits, dim=1).squeeze(0)
+            y_probs = F.softmax(y_logits, dim=1).squeeze(0)
 
-        # 2. Convert flat indices back to (action, x, y)
-        untried_top_k = []
-        priors = {}
-        
-        for p, idx in zip(top_probs, top_indices):
-            idx = idx.item()
-            a = idx // (64 * 64)
-            rem = idx % (64 * 64)
-            x = rem // 64
-            y = rem % 64
-            
-            # Only consider it if it's a valid action type (e.g., skip SUBMIT if restricted)
-            if a in self.config.valid_actions:
-                action_tuple = (a, x, y)
-                priors[action_tuple] = p.item()
-                if action_tuple not in node.children:
-                    untried_top_k.append(action_tuple)
+            candidates = []
+            coords = self.config.get_coordinate_samples()
+            for action in valid_actions:
+                if action_uses_coordinates(action):
+                    for x, y in coords:
+                        prob = a_probs[action] * x_probs[x] * y_probs[y]
+                        candidates.append((float(prob.item()), action, x, y))
+                else:
+                    candidates.append((float(a_probs[action].item()), action, 0, 0))
+            candidates.sort(reverse=True, key=lambda item: item[0])
 
-        # 3. If all Top-K actions are already expanded, node is fully expanded
-        if not untried_top_k:
-            return None
-
-        # 4. Expand the highest-probability untried action
-        action, x, y = untried_top_k[0]
-        prior_p = priors[(action, x, y)]
-
-        # Predict next state
-        s_next, rnn_next = self._predict_next_state(
-            node.s_t,
-            node.rnn_state,
-            action,
-            x,
-            y
-        )
-
-        # Create child node with prior
-        return node.add_child(action, (x, y), s_next, rnn_next, prior_p=prior_p)
+        for prior_p, action, x, y in candidates[:max(top_k * 4, top_k)]:
+            action_tuple = (action, x, y)
+            if action_tuple in node.children:
+                continue
+            s_next, rnn_next = self._predict_next_state(node.s_t, node.rnn_state, action, x, y)
+            return node.add_child(action, (x, y), s_next, rnn_next, prior_p=prior_p)
+        return None
 
     def _evaluate(self, s_t: torch.Tensor, target_grid: Optional[torch.Tensor] = None,
                   input_grid: Optional[torch.Tensor] = None) -> float:
@@ -353,27 +337,15 @@ class LatentMCTS:
         # CRITICAL: Clone rnn_state to prevent in-place corruption
         rnn_state_cloned = self._clone_rnn_state(rnn_state)
 
-        # Embed action
         action_tensor = torch.tensor([action], dtype=torch.long, device=self.device)
         x_tensor = torch.tensor([x], dtype=torch.long, device=self.device)
         y_tensor = torch.tensor([y], dtype=torch.long, device=self.device)
 
-        z_a = self.action_embed(action_tensor, x_tensor, y_tensor)  # [1, d_model]
-
-        # Predict next latent
-        s_next_pred = self.predictor(s_t, z_a)  # [1, d_model]
-
-        # Update GDN cache
-        s_next_seq = s_next_pred.unsqueeze(1)  # [1, 1, d_model]
-        s_next_context, rnn_state_next = self.gdn(
-            s_next_seq,
-            state=rnn_state_cloned,
-            use_cache=True
-        )
-
-        s_next = s_next_context.squeeze(1)  # [1, d_model]
-
-        return s_next, rnn_state_next
+        z_a = self.action_embed(action_tensor, x_tensor, y_tensor)
+        s_next_pred = self.predictor(s_t, z_a)
+        s_next_seq = s_next_pred.unsqueeze(1)
+        s_next_context, rnn_state_next = self.gdn(s_next_seq, state=rnn_state_cloned, use_cache=True)
+        return s_next_context.squeeze(1), rnn_state_next
 
     def _clone_rnn_state(self, rnn_state: Optional[Any]) -> Optional[Any]:
         """

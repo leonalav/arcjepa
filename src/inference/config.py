@@ -1,134 +1,75 @@
-"""
-Configuration for MCTS search algorithm.
-"""
-
 from dataclasses import dataclass
-from typing import List, Optional, Any
+from typing import Any, List, Optional
+
+from src.data.arc_schema import DEFAULT_NUM_ACTIONS, action_uses_coordinates, default_available_actions
 
 
 @dataclass
 class MCTSConfig:
-    """Configuration for Latent MCTS search."""
-
-    # Search budget
     num_simulations: int = 5000
-
-    # UCT exploration constant (higher = more exploration)
     c_puct: float = 1.4
-
-    # Maximum rollout depth (prevents infinite loops)
     max_depth: int = 20
-
-    # Valid action indices to consider (1-7 are game actions, 8 is SUBMIT)
-    valid_actions: List[int] = None
-
-    # Coordinate sampling strategy
-    coord_sampling: str = "sparse"  # "sparse", "dense", or "heuristic"
-    coord_stride: int = 4  # For sparse sampling: sample every Nth pixel
-
-    # Memory management
-    enable_pruning: bool = False  # Prune low-value branches
-    pruning_threshold: float = 0.01  # Prune nodes with Q < threshold
-    max_tree_nodes: int = 50000  # Maximum nodes before forced pruning
-
-    # Early stopping
-    early_stop_on_win: bool = True  # Stop search if perfect match found
-
-    # Evaluation
-    reward_shaping: str = "binary"  # "binary", "shaped", or "unsupervised"
-    evaluation_mode: str = "supervised"  # "supervised" or "unsupervised"
+    valid_actions: Optional[List[int]] = None
+    allow_submit: bool = True
+    num_actions: int = DEFAULT_NUM_ACTIONS
+    coord_sampling: str = "sparse"
+    coord_stride: int = 4
+    enable_pruning: bool = False
+    pruning_threshold: float = 0.01
+    max_tree_nodes: int = 50000
+    early_stop_on_win: bool = True
+    reward_shaping: str = "binary"
+    evaluation_mode: str = "supervised"
+    use_value_head: bool = True
 
     def __post_init__(self):
         if self.valid_actions is None:
-            # Default: all 7 game actions (exclude SUBMIT=8 during search)
-            self.valid_actions = [1, 2, 3, 4, 5, 6, 7]
+            mask = default_available_actions(self.num_actions)
+            self.valid_actions = mask.nonzero(as_tuple=False).flatten().tolist()
+            if not self.allow_submit and self.num_actions > 0:
+                self.valid_actions = [a for a in self.valid_actions if a != self.num_actions - 1]
+
+    def actions_from_mask(self, available_actions_mask: Optional[Any] = None) -> List[int]:
+        if available_actions_mask is None:
+            return list(self.valid_actions)
+        if hasattr(available_actions_mask, 'nonzero'):
+            valid = available_actions_mask.bool().nonzero(as_tuple=False).flatten().tolist()
+        else:
+            valid = [i for i, enabled in enumerate(available_actions_mask) if enabled]
+        return [int(a) for a in valid if int(a) in self.valid_actions or self.valid_actions is None]
 
     def get_coordinate_samples(self, grid_size: int = 64, current_grid: Optional[Any] = None) -> List[tuple]:
-        """
-        Generate coordinate samples based on sampling strategy.
-
-        Args:
-            grid_size: Size of the grid
-            current_grid: Optional current grid state for heuristic sampling
-
-        Returns:
-            List of (x, y) tuples to consider for actions.
-        """
         if self.coord_sampling == "dense":
-            # All coordinates (expensive!)
             return [(x, y) for x in range(grid_size) for y in range(grid_size)]
-
-        elif self.coord_sampling == "sparse":
-            # Sample every Nth coordinate
-            coords = []
-            for x in range(0, grid_size, self.coord_stride):
-                for y in range(0, grid_size, self.coord_stride):
-                    coords.append((x, y))
-            return coords
-
-        elif self.coord_sampling == "heuristic":
-            # Content-aware sampling (requires current_grid)
+        if self.coord_sampling == "sparse":
+            return [(x, y) for x in range(0, grid_size, self.coord_stride) for y in range(0, grid_size, self.coord_stride)]
+        if self.coord_sampling == "heuristic":
             if current_grid is None:
-                # Safe fallback to sparse if no grid provided for heuristics
-                coords = []
-                for x in range(0, grid_size, self.coord_stride):
-                    for y in range(0, grid_size, self.coord_stride):
-                        coords.append((x, y))
-                return coords
-
-            # Import here to avoid circular dependency
+                return [(x, y) for x in range(0, grid_size, self.coord_stride) for y in range(0, grid_size, self.coord_stride)]
             from .grid_analysis import find_edges, find_frontier, find_symmetry_points
-
             coords = set()
-
-            # Object boundaries
             coords.update(find_edges(current_grid))
-
-            # Frontier cells
             coords.update(find_frontier(current_grid))
-
-            # Symmetry points
             coords.update(find_symmetry_points(current_grid))
-
-            # Always include corners and center
-            coords.update([
-                (0, 0), (0, grid_size-1),
-                (grid_size-1, 0), (grid_size-1, grid_size-1),
-                (grid_size//2, grid_size//2)
-            ])
-
+            coords.update([(0, 0), (0, grid_size-1), (grid_size-1, 0), (grid_size-1, grid_size-1), (grid_size//2, grid_size//2)])
             return list(coords)
+        raise ValueError(f"Unknown coord_sampling: {self.coord_sampling}")
 
-        else:
-            raise ValueError(f"Unknown coord_sampling: {self.coord_sampling}")
+    def action_space(self, available_actions_mask: Optional[Any] = None, current_grid: Optional[Any] = None) -> List[tuple]:
+        coords = self.get_coordinate_samples(current_grid=current_grid)
+        action_space = []
+        for action in self.actions_from_mask(available_actions_mask):
+            if action_uses_coordinates(action):
+                action_space.extend((action, x, y) for x, y in coords)
+            else:
+                action_space.append((action, 0, 0))
+        return action_space
 
     def estimate_memory_usage(self, d_model: int = 256) -> dict:
-        """
-        Estimate VRAM usage for MCTS search.
-
-        Args:
-            d_model: Model dimension
-
-        Returns:
-            Dictionary with memory estimates in MB
-        """
-        # Per-node memory:
-        # - s_t: [1, d_model] float32 = d_model * 4 bytes
-        # - rnn_state: varies, assume ~2x d_model for GDN cache
-        # - Python overhead: ~200 bytes per node
-
         bytes_per_node = (d_model * 4) + (d_model * 8) + 200
-
-        # Estimate tree size based on branching factor
-        num_coords = len(self.get_coordinate_samples())
-        branching_factor = len(self.valid_actions) * num_coords
-
-        # Approximate tree nodes (not all branches fully expanded)
+        branching_factor = len(self.action_space())
         estimated_nodes = min(self.num_simulations, self.max_tree_nodes)
-
-        total_bytes = estimated_nodes * bytes_per_node
-        total_mb = total_bytes / (1024 * 1024)
-
+        total_mb = estimated_nodes * bytes_per_node / (1024 * 1024)
         return {
             "estimated_nodes": estimated_nodes,
             "bytes_per_node": bytes_per_node,
@@ -138,29 +79,6 @@ class MCTSConfig:
         }
 
 
-# Preset configurations for different use cases
-
-FAST_CONFIG = MCTSConfig(
-    num_simulations=1000,
-    c_puct=1.0,
-    max_depth=10,
-    coord_sampling="sparse",
-    coord_stride=8,
-)
-
-BALANCED_CONFIG = MCTSConfig(
-    num_simulations=5000,
-    c_puct=1.4,
-    max_depth=20,
-    coord_sampling="sparse",
-    coord_stride=4,
-)
-
-THOROUGH_CONFIG = MCTSConfig(
-    num_simulations=10000,
-    c_puct=2.0,
-    max_depth=30,
-    coord_sampling="sparse",
-    coord_stride=2,
-    enable_pruning=True,
-)
+FAST_CONFIG = MCTSConfig(num_simulations=1000, c_puct=1.0, max_depth=10, coord_sampling="sparse", coord_stride=8)
+BALANCED_CONFIG = MCTSConfig(num_simulations=5000, c_puct=1.4, max_depth=20, coord_sampling="sparse", coord_stride=4)
+THOROUGH_CONFIG = MCTSConfig(num_simulations=10000, c_puct=2.0, max_depth=30, coord_sampling="sparse", coord_stride=2, enable_pruning=True)

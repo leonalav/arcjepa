@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from typing import Dict, Optional
 
@@ -192,6 +193,88 @@ def compute_prediction_metrics(
     }
 
 
+def compute_action_metrics(
+    action_logits: torch.Tensor,
+    target_actions: torch.Tensor,
+    available_actions_mask: Optional[torch.Tensor] = None,
+    seq_mask: Optional[torch.Tensor] = None,
+    top_k: int = 3,
+) -> Dict[str, float]:
+    pred_T = action_logits.shape[1]
+    full_T = target_actions.shape[1]
+    K = full_T - pred_T
+    targets = target_actions[:, K:K + pred_T].to(action_logits.device)
+    mask = torch.ones_like(targets, dtype=torch.bool) if seq_mask is None else seq_mask[:, K:K + pred_T].to(action_logits.device).bool()
+
+    if available_actions_mask is not None:
+        available = available_actions_mask[:, K:K + pred_T].to(action_logits.device).bool()
+        masked_logits = action_logits.masked_fill(~available, torch.finfo(action_logits.dtype).min)
+        target_valid = available.gather(-1, targets.clamp(0, available.shape[-1] - 1).unsqueeze(-1)).squeeze(-1)
+    else:
+        available = None
+        masked_logits = action_logits
+        target_valid = torch.ones_like(mask, dtype=torch.bool)
+
+    pred = masked_logits.argmax(dim=-1)
+    valid_count = mask.float().sum().item()
+    if valid_count == 0:
+        return {'action_accuracy': 0.0, 'action_topk_accuracy': 0.0, 'invalid_action_rate': 0.0, 'target_validity_rate': 0.0}
+
+    top_k = min(top_k, masked_logits.shape[-1])
+    topk = masked_logits.topk(top_k, dim=-1).indices
+    topk_hit = (topk == targets.unsqueeze(-1)).any(dim=-1)
+    if available is not None:
+        invalid_pred = ~available.gather(-1, pred.unsqueeze(-1)).squeeze(-1)
+    else:
+        invalid_pred = torch.zeros_like(mask, dtype=torch.bool)
+
+    return {
+        'action_accuracy': ((pred == targets) & mask).float().sum().item() / valid_count,
+        'action_topk_accuracy': (topk_hit & mask).float().sum().item() / valid_count,
+        'invalid_action_rate': (invalid_pred & mask).float().sum().item() / valid_count,
+        'target_validity_rate': (target_valid & mask).float().sum().item() / valid_count,
+    }
+
+
+def compute_terminal_metrics(
+    terminal_logits: torch.Tensor,
+    terminal_targets: torch.Tensor,
+    seq_mask: Optional[torch.Tensor] = None,
+) -> Dict[str, float]:
+    pred_T = terminal_logits.shape[1]
+    full_T = terminal_targets.shape[1]
+    K = full_T - pred_T
+    targets = terminal_targets[:, K:K + pred_T].to(terminal_logits.device).float()
+    mask = torch.ones_like(targets, dtype=torch.bool) if seq_mask is None else seq_mask[:, K:K + pred_T].to(terminal_logits.device).bool()
+    preds = torch.sigmoid(terminal_logits) >= 0.5
+    valid_count = mask.float().sum().item()
+    if valid_count == 0:
+        return {'terminal_accuracy': 0.0, 'terminal_positive_rate': 0.0}
+    return {
+        'terminal_accuracy': ((preds == targets.bool()) & mask).float().sum().item() / valid_count,
+        'terminal_positive_rate': (preds & mask).float().sum().item() / valid_count,
+    }
+
+
+def compute_efficiency_metrics(
+    efficiency_pred: torch.Tensor,
+    efficiency_target: torch.Tensor,
+    seq_mask: Optional[torch.Tensor] = None,
+) -> Dict[str, float]:
+    pred_T = efficiency_pred.shape[1]
+    full_T = efficiency_target.shape[1]
+    K = full_T - pred_T
+    target = efficiency_target[:, K:K + pred_T].to(efficiency_pred.device).float()
+    mask = torch.ones_like(target) if seq_mask is None else seq_mask[:, K:K + pred_T].to(efficiency_pred.device).float()
+    pred = torch.sigmoid(efficiency_pred)
+    mae = (torch.abs(pred - target) * mask).sum() / (mask.sum() + 1e-8)
+    return {
+        'efficiency_mae': mae.item(),
+        'efficiency_pred_mean': ((pred * mask).sum() / (mask.sum() + 1e-8)).item(),
+        'efficiency_target_mean': ((target * mask).sum() / (mask.sum() + 1e-8)).item(),
+    }
+
+
 def compute_gradient_metrics(model: nn.Module) -> Dict[str, float]:
     """
     Compute gradient health metrics.
@@ -283,7 +366,7 @@ def compute_data_statistics(
         valid_target_states = target_states.reshape(B * T, H, W)
 
     if len(valid_target_states) == 0:
-        return {'noop_ratio': padding_ratio, 'foreground_ratio': 0.0, 'unique_colors_mean': 0.0, 'grid_entropy_mean': 0.0}
+        return {'noop_ratio': padding_ratio, 'padding_ratio': padding_ratio, 'foreground_ratio': 0.0, 'unique_colors_mean': 0.0, 'grid_entropy_mean': 0.0}
 
     # Deception 1 Fix: Calculate foreground ratio ONLY within the active grid of valid states
     active_mask = torch.zeros_like(valid_target_states, dtype=torch.bool)
@@ -321,8 +404,16 @@ def compute_data_statistics(
         entropy_list.append(entropy)
     grid_entropy_mean = np.mean(entropy_list) if entropy_list else 0.0
 
+    true_noop_ratio = (states == target_states).reshape(B, T, -1).all(dim=-1).float()
+    if seq_mask is not None:
+        true_noop_ratio = (true_noop_ratio * seq_mask[:, :T].float()).sum() / (seq_mask[:, :T].float().sum() + 1e-8)
+        true_noop_ratio = true_noop_ratio.item()
+    else:
+        true_noop_ratio = true_noop_ratio.mean().item()
+
     return {
-        'noop_ratio': padding_ratio,
+        'noop_ratio': true_noop_ratio,
+        'padding_ratio': padding_ratio,
         'foreground_ratio': foreground_ratio,
         'unique_colors_mean': unique_colors_mean,
         'grid_entropy_mean': grid_entropy_mean

@@ -37,11 +37,15 @@ from src.models.world_model import ARCJEPAWorldModel
 from src.training.loss import ARCJPELoss
 from src.training.ema import EMAUpdater
 from src.data.dataset import ARCTrajectoryDataset, create_mock_trajectory, FastHFARCDataset
+from src.data.arc_schema import DEFAULT_NUM_ACTIONS
 from src.training.metrics import (
     compute_latent_metrics,
     compute_prediction_metrics,
     compute_gradient_metrics,
-    compute_data_statistics
+    compute_data_statistics,
+    compute_action_metrics,
+    compute_terminal_metrics,
+    compute_efficiency_metrics,
 )
 
 def setup_dist(local_rank_arg=-1):
@@ -130,6 +134,18 @@ def train():
     parser.add_argument("--filter_noops", action="store_true", help="Filter no-op trajectories from dataset")
     parser.add_argument("--num_trajectories", type=int, default=1000, help="Number of trajectories to generate")
     parser.add_argument("--logger", type=str, default="csv", choices=["wandb", "tensorboard", "csv"], help="Logging backend")
+    parser.add_argument("--d_model", type=int, default=512)
+    parser.add_argument("--num_vit_layers", type=int, default=6)
+    parser.add_argument("--num_gdn_heads", type=int, default=8)
+    parser.add_argument("--num_actions", type=int, default=DEFAULT_NUM_ACTIONS)
+    parser.add_argument("--max_games", type=int, default=4096)
+    parser.add_argument("--max_game_families", type=int, default=512)
+    parser.add_argument("--policy_weight", type=float, default=0.25)
+    parser.add_argument("--coord_weight", type=float, default=0.25)
+    parser.add_argument("--terminal_weight", type=float, default=0.1)
+    parser.add_argument("--value_weight", type=float, default=0.1)
+    parser.add_argument("--efficiency_weight", type=float, default=0.1)
+    parser.add_argument("--split_seed", type=int, default=0)
 
     args = parser.parse_args()
 
@@ -162,7 +178,10 @@ def train():
         dataset = FastHFARCDataset(
             hf_repo_id=args.hf_repo_id,
             split="train",
-            compute_temporal_masks=args.compute_temporal_masks
+            compute_temporal_masks=args.compute_temporal_masks,
+            num_actions=args.num_actions,
+            max_games=args.max_games,
+            max_game_families=args.max_game_families
         )
     else:
         data_path = Path(args.data_dir)
@@ -176,7 +195,7 @@ def train():
         if is_main_process:
             if not check_training_files_exist(data_path):
                 print(f"No recordings found in {args.data_dir} (or its subdirectories). Generating real trajectories via ARC-AGI...")
-                create_mock_trajectory(args.data_dir, num_trajectories=args.num_trajectories)
+                create_mock_trajectory(args.data_dir, num_trajectories=args.num_trajectories, split_seed=args.split_seed)
             else:
                 print(f"Training files found in {args.data_dir}. Skipping data generation.")
 
@@ -202,7 +221,10 @@ def train():
             window_size=window_size,
             multistep_k=args.multistep_k,
             compute_temporal_masks=args.compute_temporal_masks,
-            filter_noops=args.filter_noops
+            filter_noops=args.filter_noops,
+            num_actions=args.num_actions,
+            max_games=args.max_games,
+            max_game_families=args.max_game_families
         )
 
         if is_main_process:
@@ -225,10 +247,13 @@ def train():
 
     # 2. Initialize Model & Components
     model = ARCJEPAWorldModel(
-        d_model=512,
-        num_vit_layers=6,
-        num_gdn_heads=8,
-        multistep_k=args.multistep_k
+        d_model=args.d_model,
+        num_vit_layers=args.num_vit_layers,
+        num_gdn_heads=args.num_gdn_heads,
+        multistep_k=args.multistep_k,
+        num_actions=args.num_actions,
+        max_games=args.max_games,
+        max_game_families=args.max_game_families
     )
     if not IS_TPU:
         model = model.to(device)
@@ -262,7 +287,13 @@ def train():
         use_focal=args.use_focal,
         focal_alpha=args.focal_alpha,
         focal_gamma=args.focal_gamma,
-        temporal_weight_multiplier=args.temporal_weight
+        temporal_weight_multiplier=args.temporal_weight,
+        policy_weight=args.policy_weight,
+        coord_weight=args.coord_weight,
+        terminal_weight=args.terminal_weight,
+        value_weight=args.value_weight,
+        efficiency_weight=args.efficiency_weight,
+        num_actions=args.num_actions
     )
 
     # ── Optimizer with proper weight decay groups (E4 fix) ────────────────────
@@ -292,7 +323,6 @@ def train():
     # I-JEPA paper: start tau=0.996, linearly anneal to 1.0 throughout training.
     ema_updater = EMAUpdater(online_enc, target_enc, tau_start=0.996, tau_end=1.0)
 
-<<<<<<< HEAD
     # ── Cosine LR Schedule with Warmup (E1 fix) ──────────────────────────────
     # CITATION: V-JEPA uses warmup + cosine decay.
     total_steps = args.epochs * len(dataloader)
@@ -316,41 +346,31 @@ def train():
         if is_main_process:
             print(f"Loading checkpoint from {args.resume_checkpoint}...")
 
-        checkpoint = torch.load(args.resume_checkpoint, map_location='cpu')
-
-=======
-    # ── CHECKPOINT CONTINUATION MECHANISM ─────────────────────────────────────
-    start_epoch = 0
-    if args.resume_checkpoint and os.path.exists(args.resume_checkpoint):
-        if is_main_process:
-            print(f"Loading checkpoint from {args.resume_checkpoint}...")
-            
         # Load entirely into CPU RAM first to avoid XLA memory fragmentation
         checkpoint = torch.load(args.resume_checkpoint, map_location='cpu')
 
         # Handle legacy checkpoints (which were just pure state_dicts) gracefully
->>>>>>> 0967acae9b73b76b5f103e54e4374e1ebbff86c9
+
         if 'model_state_dict' not in checkpoint:
             state_dict = checkpoint
             opt_dict = None
+            scheduler_dict = None
             ckpt_epoch = 0
-<<<<<<< HEAD
+            ckpt_global_step = 0
             import re
             match = re.search(r'epoch_(\d+)', args.resume_checkpoint)
             if match:
                 ckpt_epoch = int(match.group(1))
             if is_main_process:
                 print(f"Legacy checkpoint detected. Restoring weights without optimizer states (extracted epoch {ckpt_epoch} from filename).")
-=======
-            if is_main_process:
-                print("Legacy checkpoint detected. Restoring weights without optimizer states.")
->>>>>>> 0967acae9b73b76b5f103e54e4374e1ebbff86c9
         else:
             state_dict = checkpoint['model_state_dict']
             opt_dict = checkpoint.get('optimizer_state_dict', None)
+            scheduler_dict = checkpoint.get('scheduler_state_dict', None)
             ckpt_epoch = checkpoint.get('epoch', 0)
+            ckpt_global_step = checkpoint.get('global_step', ckpt_epoch * len(dataloader))
 
-<<<<<<< HEAD
+        # Strip module prefixes if saved via DDP
         state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
 
         if IS_TPU:
@@ -368,30 +388,13 @@ def train():
                     print("Optimizer state incompatible (architecture changed). Starting fresh optimizer.")
 
         start_epoch = ckpt_epoch
-        global_step = start_epoch * len(dataloader)
-
-        # Advance scheduler to match
-        for _ in range(global_step):
-            scheduler.step()
-
-=======
-        # Strip module prefixes if saved via DDP
-        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-
-        # Load Model Weights
-        if IS_TPU:
-            unwrapped = accelerator.unwrap_model(model)
-            unwrapped.load_state_dict(state_dict)
+        global_step = ckpt_global_step
+        if scheduler_dict is not None:
+            scheduler.load_state_dict(scheduler_dict)
         else:
-            unwrapped = model.module if hasattr(model, 'module') else model
-            unwrapped.load_state_dict(state_dict)
+            for _ in range(global_step):
+                scheduler.step()
 
-        # Load Optimizer State
-        if opt_dict is not None and not args.deepspeed:
-            optimizer.load_state_dict(opt_dict)
-            
-        start_epoch = ckpt_epoch
->>>>>>> 0967acae9b73b76b5f103e54e4374e1ebbff86c9
         if is_main_process:
             print(f"Successfully resumed. Starting from Epoch {start_epoch + 1}")
     # ──────────────────────────────────────────────────────────────────────────
@@ -526,6 +529,22 @@ def train():
                     )
                     grad_metrics = compute_gradient_metrics(model)
                     data_metrics = compute_data_statistics(states_cpu, target_states_cpu, seq_mask=seq_mask_cpu)
+                    action_metrics = compute_action_metrics(
+                        outputs['raw_action_logits'].detach().cpu(),
+                        batch['actions'].detach().cpu(),
+                        batch.get('available_actions_mask', None).detach().cpu() if isinstance(batch.get('available_actions_mask', None), torch.Tensor) else None,
+                        seq_mask=seq_mask_cpu
+                    )
+                    terminal_metrics = compute_terminal_metrics(
+                        outputs['terminal_logits'].detach().cpu(),
+                        batch.get('terminal', torch.zeros_like(batch['actions'])).detach().cpu(),
+                        seq_mask=seq_mask_cpu
+                    )
+                    efficiency_metrics = compute_efficiency_metrics(
+                        outputs['efficiency_pred'].detach().cpu(),
+                        batch.get('efficiency_target', torch.zeros_like(batch['actions'], dtype=torch.float32)).detach().cpu(),
+                        seq_mask=seq_mask_cpu
+                    )
 
                     loss_dict_cpu = {}
                     for k_name, v_val in loss_dict.items():
@@ -544,7 +563,10 @@ def train():
                         **latent_metrics,
                         **pred_metrics,
                         **grad_metrics,
-                        **data_metrics
+                        **data_metrics,
+                        **action_metrics,
+                        **terminal_metrics,
+                        **efficiency_metrics
                     }
 
                     if is_main_process:
@@ -563,7 +585,9 @@ def train():
                         print(f"  Accuracy: pixel={pred_metrics['pixel_accuracy']:.3f} fg={pred_metrics['foreground_accuracy']:.3f} bg={pred_metrics['background_accuracy']:.3f}")
                         if args.compute_temporal_masks:
                             print(f"  Temporal: changed={pred_metrics['changed_pixel_accuracy']:.3f} unchanged={pred_metrics['unchanged_pixel_accuracy']:.3f}")
-                        print(f"  Data: noop={data_metrics['noop_ratio']:.3f} fg_ratio={data_metrics['foreground_ratio']:.3f}")
+                        print(f"  Data: noop={data_metrics['noop_ratio']:.3f} padding={data_metrics['padding_ratio']:.3f} fg_ratio={data_metrics['foreground_ratio']:.3f}")
+                        print(f"  Action: acc={action_metrics['action_accuracy']:.3f} invalid={action_metrics['invalid_action_rate']:.3f} target_valid={action_metrics['target_validity_rate']:.3f}")
+                        print(f"  Terminal: acc={terminal_metrics['terminal_accuracy']:.3f} | Efficiency MAE={efficiency_metrics['efficiency_mae']:.3f}")
                         if args.multistep_k > 1:
                             print(f"  MultiStep: loss={loss_dict_cpu['multistep_jepa_loss']:.4f}")
                         print(f"  EMA tau={ema_updater.tau:.5f} | LR={current_lr:.6f}")
@@ -580,33 +604,21 @@ def train():
 
             save_path = Path(args.output_dir)
             save_path.mkdir(exist_ok=True)
-<<<<<<< HEAD
-
             checkpoint_dict = {
                 'epoch': epoch + 1,
                 'global_step': global_step,
-                'optimizer_state_dict': optimizer.state_dict()
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'config': vars(args),
+                'action_registry_version': 'arc_schema_v1'
             }
 
-=======
-            
-            # Create a full checkpoint dictionary
-            checkpoint_dict = {
-                'epoch': epoch + 1,
-                'optimizer_state_dict': optimizer.state_dict()
-            }
-            
->>>>>>> 0967acae9b73b76b5f103e54e4374e1ebbff86c9
             if IS_TPU:
                 unwrapped_model = accelerator.unwrap_model(model)
                 checkpoint_dict['model_state_dict'] = unwrapped_model.state_dict()
             else:
                 checkpoint_dict['model_state_dict'] = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
-<<<<<<< HEAD
 
-=======
-                
->>>>>>> 0967acae9b73b76b5f103e54e4374e1ebbff86c9
             torch.save(checkpoint_dict, save_path / f"world_model_epoch_{epoch+1}.pt")
 
             if args.logger == "csv" and csv_metrics:
