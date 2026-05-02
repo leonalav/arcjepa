@@ -52,3 +52,15 @@ accelerate launch --num_processes 8 --mixed_precision bf16 train.py \
   --multistep_k 3 \
   --filter_noops \
   --logger csv
+
+
+# Mining run:
+python mine_wins.py \
+  --game_ids_file configs/game_ids/seed25.txt \
+  --out_dir data/raw_episodes \
+  --workers 2 \
+  --algorithm portfolio \
+  --episodes_per_game 1000 \
+  --max_steps 100 \
+  --max_nodes 10000 \
+  --max_env_steps 100000

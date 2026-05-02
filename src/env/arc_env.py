@@ -78,7 +78,14 @@ class ARCEnvAdapter:
 
     def action_to_raw(self, action: ARCAction) -> tuple[Any, Optional[dict[str, int]]]:
         name = action_name(action.action_id)
-        raw_action = getattr(self.game_action_enum, name, name) if self.game_action_enum is not None else name
+        raw_action = getattr(self.game_action_enum, name, None) if self.game_action_enum is not None else None
+        if raw_action is None and self.current_obs is not None:
+            for candidate in self._extract_available_actions(self.current_obs.raw) or []:
+                if parse_action_name(candidate) == action.action_id:
+                    raw_action = candidate
+                    break
+        if raw_action is None:
+            raw_action = name
         data = {"x": int(action.x), "y": int(action.y)} if action_uses_coordinates(action.action_id) else None
         return raw_action, data
 

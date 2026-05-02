@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import arc_agi
+from arcengine import GameAction, GameState
 
 from src.env.arc_env import ARCEnvAdapter
 from src.search.algorithms.beam import BeamSearchSolver
@@ -12,7 +13,13 @@ def mine_game_worker(args: dict):
     game_id = args["game_id"]
     env_dir = args.get("env_dir")
     arcade = arc_agi.Arcade(environments_dir=env_dir) if env_dir else arc_agi.Arcade()
-    adapter = ARCEnvAdapter(arcade, game_id=game_id, save_recording=False)
+    adapter = ARCEnvAdapter(
+        arcade,
+        game_id=game_id,
+        save_recording=False,
+        game_action_enum=GameAction,
+        game_state_enum=GameState,
+    )
     algorithm = args.get("algorithm", "random_legal")
     max_steps = int(args.get("max_steps", 100))
     seed = int(args.get("seed", 0))

@@ -1,4 +1,5 @@
 import json
+from enum import Enum
 from pathlib import Path
 
 import numpy as np
@@ -11,14 +12,14 @@ from src.env.types import ARCAction, ARCObs, ARCStepResult
 from src.search.algorithms.random_legal import RandomLegalSolver
 
 
-class FakeGameAction:
+class FakeGameAction(Enum):
     ACTION1 = "ACTION1"
     ACTION2 = "ACTION2"
     ACTION6 = "ACTION6"
     SUBMIT = "SUBMIT"
 
 
-class FakeState:
+class FakeState(Enum):
     READY = "READY"
     WIN = "WIN"
     GAME_OVER = "GAME_OVER"
@@ -43,6 +44,8 @@ class FakeEnv:
         return FakeRawObs([[0, 1], [0, 0]], [FakeGameAction.ACTION1, FakeGameAction.ACTION6])
 
     def step(self, action, data=None):
+        if not hasattr(action, "name"):
+            raise AttributeError(f"{type(action).__name__!r} object has no attribute 'name'")
         self.steps.append((action, data))
         if len(self.steps) == 1:
             return FakeRawObs([[0, 1], [2, 0]], [FakeGameAction.SUBMIT], score=0.5)
@@ -74,6 +77,16 @@ def test_env_adapter_normalizes_observation_and_executes_legal_action():
     assert isinstance(result, ARCStepResult)
     assert result.valid_action
     assert result.obs.score == 0.5
+    assert adapter.raw_env.steps[-1] == (FakeGameAction.ACTION6, {"x": 1, "y": 1})
+
+
+def test_env_adapter_uses_raw_available_action_objects_when_no_enum_is_configured():
+    adapter = ARCEnvAdapter(FakeArcade(), game_id="ls20-abc")
+    adapter.reset()
+
+    result = adapter.step(ARCAction(parse_action_name("ACTION6"), x=1, y=1))
+
+    assert result.valid_action
     assert adapter.raw_env.steps[-1] == (FakeGameAction.ACTION6, {"x": 1, "y": 1})
 
 
